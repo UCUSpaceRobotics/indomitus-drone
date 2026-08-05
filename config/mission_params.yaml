@@ -1,0 +1,40 @@
+# ERC 2026 Droning Sub-Task — Mission Parameters
+
+flight:
+  takeoff_altitude_m: 2.0        # Search altitude
+  search_altitude_m: 2.5         # Height for marker search sweep
+  landing_approach_altitude_m: 1.0
+  max_horizontal_speed_m_s: 0.5
+  max_vertical_speed_m_s: 0.3
+
+markers:
+  origin_id: 101                 # ArUco ID for takeoff pad (15x15 cm)
+  landing_target_id: 102         # ArUco ID for landing disc (15x15 cm)
+  marker_size_m: 0.15
+  dictionary: aruco_original
+
+mission:
+  num_landings: 3                # Land 3 times total
+  search_radius_m: 3.0           # Competition area radius
+  landing_success_radius_m: 0.5  # Landing disc radius
+
+grid:
+  origin_x_m: -2.5               # Grid origin (bottom-left corner)
+  origin_y_m: -0.5
+  cell_size_m: 1.0               # 1x1 m sectors
+  columns: [A, B, C, D, E, F]
+  rows: [1, 2, 3, 4, 5, 6]
+
+serial:
+  port: /dev/ttyAMA0
+  baudrate: 921600
+
+ros2:
+  vision_topic: /erc/vision_targets
+  domain_id: 42
+
+timeouts:
+  takeoff_s: 15.0
+  search_sweep_s: 60.0
+  alignment_s: 10.0
+  landing_s: 15.0
