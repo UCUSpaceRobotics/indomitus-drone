@@ -19,6 +19,7 @@
 11. [External Dependencies & Filesystem Layout](#11-external-dependencies--filesystem-layout)
 12. [Startup & Deployment Sequence](#12-startup--deployment-sequence)
 13. [Configuration Reference](#13-configuration-reference)
+14. [Implementation Status & TODO](#14-implementation-status--todo)
 
 ---
 
@@ -181,16 +182,16 @@ This node does **NOT** live in this repository. It is:
 ### ROS 2 Topic Output
 
 **Topic:** `/erc/vision_targets`
+**Message Type:** `geometry_msgs/msg/Point`
 
-The exact message type will be defined when the Simulink model is built. The expected schema:
+The `z` field encodes the detection type. The routing convention used by `VisionBridge`:
 
-| Field | Type | Unit | Description |
-|-------|------|------|-------------|
-| `x` | float64 | meters | Horizontal offset of target from camera center (body-frame right) |
-| `y` | float64 | meters | Vertical offset of target from camera center (body-frame forward) |
-| `z` | float64 | — | Marker ID (101.0, 102.0) or 0.0 if no detection |
-
-For initial development, we use `geometry_msgs/msg/Point` as the message type.
+| `z` value | Detection Type | `x` meaning | `y` meaning |
+|-----------|---------------|-------------|-------------|
+| `101.0` | Takeoff pad marker | Camera-frame horizontal offset (meters, right = +) | Camera-frame vertical offset (meters, forward = +) |
+| `102.0` | Landing target marker | Camera-frame horizontal offset (meters, right = +) | Camera-frame vertical offset (meters, forward = +) |
+| `< 0` (e.g. `-1.0`) | Probe detected | World X position relative to takeoff pad (meters, North) | World Y position relative to takeoff pad (meters, East) |
+| `0.0` | No detection / heartbeat | Ignored | Ignored |
 
 ---
 
@@ -498,47 +499,80 @@ This module is **copied directly from the proven old repository** (`indomitus-dr
 
 ### `src/ros_bridge/` — ROS 2 Integration Layer
 
-#### `src/ros_bridge/vision_subscriber.py`
-**Role:** `rclpy` ROS 2 node that subscribes to `/erc/vision_targets` and makes vision data available to the state machine.
+#### `src/ros_bridge/vision_subscriber.py` ✅ IMPLEMENTED
+**Role:** ROS 2 bridge that subscribes to `/erc/vision_targets` and provides a clean polling API to the state machine. Encapsulates all `rclpy` complexity so the state machine never imports ROS 2 directly.
 
-**What it does:**
-- Creates a ROS 2 subscriber on the `/erc/vision_targets` topic.
-- On each message callback, updates a shared data structure (e.g., thread-safe variable or callback-accessible attribute) with the latest target coordinates.
-- Provides a `get_latest_target()` method for the state machine to poll.
+**Internal Class: `_VisionSubscriberNode(Node)`**
+- An internal `rclpy.Node` not exposed outside the module.
+- Creates a subscription to the configured topic with QoS queue depth 10.
 
-**Key design decision:** The subscriber runs in the main process (not a separate process) because `rclpy.spin()` can be driven incrementally with `rclpy.spin_once(node, timeout_sec=0)` inside the state machine's main loop, avoiding the need for a third process.
+**Public Class: `VisionBridge`**
+
+*Constructor:* `VisionBridge(topic, grid_config, detection_timeout_s)`
+- `topic` — ROS 2 topic name (default: `/erc/vision_targets`).
+- `grid_config` — the `grid` section from `mission_params.yaml`. If provided, enables automatic probe-to-sector mapping.
+- `detection_timeout_s` — how many seconds before a detection is considered stale (default: 0.5s).
+
+*Key Methods:*
+- **`spin_once()`** — Non-blocking. Calls `rclpy.spin_once(node, timeout_sec=0)` to process any pending DDS messages. Must be called on every main loop iteration.
+- **`get_latest_target()`** → `dict | None` — Returns the most recent ArUco marker detection, or `None` if nothing detected or last detection is stale. Returns:
+  ```python
+  {"marker_id": 102, "x_offset_m": 0.15, "y_offset_m": -0.08, "age_s": 0.05}
+  ```
+- **`get_detected_probes()`** → `list[str]` — Returns sorted, deduplicated list of probe sector IDs (e.g., `["A2", "C4"]`).
+- **`clear_probes()`** — Resets probe accumulator (call between mission attempts).
+- **`get_message_count()`** → `int` — Total messages received (diagnostics).
+- **`shutdown()`** — Destroys the internal ROS 2 node.
+
+*Internal Callback: `_on_vision_msg(msg)`*
+- Routes based on `msg.z` value:
+  - `z = 101 or 102` → stores as latest marker target with timestamp.
+  - `z < 0` → probe detection, passes `(msg.x, msg.y)` to `GridMapper`, accumulates sector ID.
+  - `z = 0` → no detection, silently ignored.
+
+**Key design decision:** Uses `spin_once()` (non-blocking, single-threaded) instead of `rclpy.spin()` in a thread. This avoids threading + multiprocessing + serial = debugging nightmare. The main loop calls `spin_once()` at ~50 Hz, which is fast enough for 10–30 Hz vision data.
 
 ---
 
 ### `src/navigation/` — Autonomous Flight Logic
 
-#### `src/navigation/state_machine.py`
+#### `src/navigation/state_machine.py` ⬜ NOT YET IMPLEMENTED
 **Role:** The core autonomous flight state machine. Implements the Search → Align → Land mission cycle.
 
-**What it does:**
-- Maintains the current flight state (IDLE, TAKEOFF, SEARCH, ALIGN, LAND, COMPLETE).
-- Each state has an `enter()`, `update()`, and `exit()` lifecycle.
-- `update()` is called on every main loop iteration (~10–50 Hz).
-- Reads vision data from the `VisionSubscriber`.
-- Reads telemetry from `telemetry_queue`.
-- Writes flight commands to `command_queue`.
+**Planned design:**
+- **`FlightState` enum:** IDLE, TAKEOFF, SEARCH, ALIGN, LAND, COMPLETE, MISSION_DONE.
+- **`MissionController` class:** Holds references to `command_queue`, `telemetry_queue`, `VisionBridge`, and config. Exposes a single `update()` method called 50 times/second by the main loop.
+- **`update()` is NOT about changing states** — it executes the *work* for the current state (send velocity commands, check altitude, read vision) and checks if the exit condition for that state is met. Most calls return without changing state.
 
-**Key behaviors by state:**
-- **SEARCH:** Executes an expanding spiral or grid sweep pattern at search altitude. Monitors vision topic for marker 102 detections.
-- **ALIGN:** Reduces altitude gradually. Sends velocity corrections to minimize the X/Y offset reported by the vision system. Uses a proportional controller (or PID) for smooth convergence.
-- **LAND:** Switches to precision landing mode. Continuously sends `LANDING_TARGET` messages with the marker's body-frame position. Monitors altitude for touchdown confirmation.
+**Per-state behavior:**
+- **IDLE:** Wait for EKF healthy + telemetry connected, then → TAKEOFF.
+- **TAKEOFF:** Arm → LOITER → GUIDED → takeoff command → monitor altitude. Condition: altitude ≥ 90% target → SEARCH. Timeout: 15s → COMPLETE (failed).
+- **SEARCH:** Hover at search altitude, check vision for marker 102. Condition: marker 102 detected → ALIGN. Timeout: 60s → LAND. (Search sweep pattern to be added later.)
+- **ALIGN:** Send velocity corrections using proportional controller: `vx = Kp * y_offset`, `vy = Kp * x_offset`. Condition: centered within 5 cm for 1 second → LAND. Lost target > 0.5s → SEARCH. Timeout: 10s → LAND.
+- **LAND:** Send `LANDING_TARGET` messages for precision landing. Condition: altitude ≈ 0 + disarmed → COMPLETE. Timeout: 15s → COMPLETE.
+- **COMPLETE:** Increment attempt counter. Attempts < 3 → IDLE. Attempts = 3 → MISSION_DONE.
 
 ---
 
 ### `src/utils/` — Utility Modules
 
-#### `src/utils/grid_mapper.py`
-**Role:** Converts probe world coordinates (x, y) in meters to the 1 × 1 m alphanumeric grid sector IDs used for competition scoring.
+#### `src/utils/grid_mapper.py` ✅ IMPLEMENTED
+**Role:** Converts probe world coordinates (x, y) in meters to competition grid sector IDs.
 
-**What it does:**
-- Takes a probe's estimated (x, y) position relative to the takeoff pad.
-- Maps it to a sector ID like "A2", "C4", "F6".
-- Uses grid configuration from `config/mission_params.yaml` (origin, cell size, column/row labels).
+**Class: `GridMapper`**
+
+*Constructor:* `GridMapper(grid_config)` — takes the `grid` section from `mission_params.yaml`.
+
+*Coordinate convention:*
+- X axis (North in NED) → mapped to columns (A, B, C, ...).
+- Y axis (East in NED) → mapped to rows (1, 2, 3, ...).
+- Grid origin `(origin_x_m, origin_y_m)` is the bottom-left corner of the grid, relative to the takeoff pad center.
+
+*Key Methods:*
+- **`position_to_sector(x_m, y_m)`** → `str | None` — Converts world position to sector ID (e.g., `"A2"`). Returns `None` if outside grid boundaries. Uses floor division for positions on cell boundaries.
+- **`get_grid_bounds()`** → `dict` — Returns `{x_min, x_max, y_min, y_max}` for the grid extent.
+
+**Tested:** 14 unit tests covering basic mapping, boundary cases, out-of-bounds positions, and custom configurations. All passing.
 
 ---
 
@@ -548,6 +582,7 @@ This module is **copied directly from the proven old repository** (`indomitus-dr
 **Role:** Single source of truth for all tunable mission parameters.
 
 **Sections:**
+- `startup` — Pixhawk initialization delay (seconds to wait for heartbeat + EKF convergence after boot).
 - `flight` — Altitudes (takeoff, search, approach), speed limits.
 - `markers` — ArUco IDs (101, 102), marker physical size, dictionary name.
 - `mission` — Number of landing attempts, search radius, success radius.
@@ -593,13 +628,23 @@ This module is **copied directly from the proven old repository** (`indomitus-dr
 
 ### `tests/` — Test Modules
 
-#### `tests/test_dummy_publisher.py`
-**Role:** Simulates the Simulink vision node by publishing fake target coordinates to `/erc/vision_targets`.
+#### `tests/test_dummy_publisher.py` ✅ IMPLEMENTED
+**Role:** Simulates the Simulink vision node by publishing fake target coordinates to `/erc/vision_targets` at 10 Hz.
 
-**Used for:** Bench testing the state machine without the Simulink node or actual camera. Publishes randomized (or scripted) X/Y offsets at 10 Hz.
+**Supports 5 simulation modes** (selected via `--mode` CLI argument):
 
-#### `tests/test_grid_mapper.py`
-**Role:** Unit tests for the grid coordinate-to-sector mapping logic.
+| Mode | What it simulates | Tests |
+|------|-------------------|-------|
+| `circle` (default) | Marker 102 drifting in a 0.3 m radius circle | ALIGN convergence — state machine must follow a moving target |
+| `static` | Marker 102 at a fixed (0.15, -0.10) m offset | Steady-state ALIGN + LAND transition |
+| `approach` | Marker 102 exponentially converging to center over ~10 s | Successful alignment sequence |
+| `probes-only` | Only probe detections (z = -1.0), no markers | SEARCH timeout + probe sector accumulation |
+| `intermittent` | Marker 102 visible for 3 s, gone for 2 s, repeating | Lost-target recovery (ALIGN → SEARCH → ALIGN) |
+
+**Usage:** `python3 tests/test_dummy_publisher.py --mode circle --topic /erc/vision_targets`
+
+#### `tests/test_grid_mapper.py` ✅ IMPLEMENTED
+**Role:** 14 unit tests for the `GridMapper` class. Covers basic mapping, cell boundaries, out-of-bounds positions, custom configs, and edge cases. Runs standalone or with pytest.
 
 ---
 
@@ -704,3 +749,138 @@ These are configured on the Pixhawk, not in this codebase, but are critical to t
 | `MAVLINK20` | `1` | `mavlink_client.py` (in code) |
 | `ROS_DOMAIN_ID` | `42` | `start_mission.sh` |
 | `ROS_DISTRO` | `jazzy` | `~/.bashrc` (auto-set by ROS 2 setup) |
+
+---
+
+## 14. Implementation Status & TODO
+
+### Current Status (as of 2026-08-08)
+
+| File | Status | Notes |
+|------|--------|-------|
+| `src/comm/mavlink_client.py` | ✅ Complete | 580 lines, flight-tested, copied from old repo |
+| `src/comm/mavlink_node.py` | ✅ Complete | Process loop + command dispatcher, copied from old repo |
+| `src/ros_bridge/vision_subscriber.py` | ✅ Complete | VisionBridge class with marker tracking + probe accumulation |
+| `src/utils/grid_mapper.py` | ✅ Complete | GridMapper class, 14 unit tests passing |
+| `src/navigation/state_machine.py` | ⬜ Empty | Core autonomous flight logic — highest priority |
+| `main.py` | ⬜ Empty | Application entry point wiring everything together |
+| `tests/test_dummy_publisher.py` | ✅ Complete | 5 simulation modes for bench testing |
+| `tests/test_grid_mapper.py` | ✅ Complete | 14 tests, all passing |
+| `config/mission_params.yaml` | ✅ Complete | All parameters defined including startup delay |
+| `docs/ARCHITECTURE.md` | ✅ Complete | This file |
+| `docs/SETUP_RASPBERRY.md` | ✅ Complete | Raspberry Pi 5 setup guide |
+| `scripts/start_mission.sh` | ✅ Complete | One-command launcher |
+| `scripts/install_ros2_jazzy.sh` | ✅ Complete | ROS 2 installer, already run successfully on Pi |
+
+### TODO — Files to Implement
+
+#### `src/navigation/state_machine.py` — Priority: HIGH
+
+The core autonomous flight state machine. Must implement:
+
+1. **`FlightState` enum** — IDLE, TAKEOFF, SEARCH, ALIGN, LAND, COMPLETE, MISSION_DONE.
+2. **`MissionController` class** with an `update()` method called ~50 times/second.
+3. **Per-state `_update_*()` methods** — each executes the work for that state and checks exit conditions.
+4. **State transition logic** — see Section 8 for the full state diagram and transition conditions.
+5. **Telemetry refresh** — drain `telemetry_queue` on each tick, keep only the latest.
+
+#### `main.py` — Priority: HIGH
+
+The application entry point. Must implement:
+
+1. Load `config/mission_params.yaml` with PyYAML.
+2. Call `rclpy.init()`.
+3. Create `multiprocessing.Queue` instances for telemetry and commands.
+4. Spawn the MAVLink comm process (`comm_process_loop` from `mavlink_node.py`).
+5. Wait `startup.pixhawk_init_delay_s` seconds for Pixhawk connection.
+6. Create `VisionBridge` instance.
+7. Create `MissionController` instance.
+8. Run main loop at ~50 Hz: call `mission.update()` until `MISSION_DONE`.
+9. Handle `Ctrl+C` graceful shutdown: send LAND command, terminate processes.
+
+### TODO — Features to Add Later
+
+#### Search Sweep Pattern — Priority: MEDIUM
+
+The SEARCH state currently just hovers and waits for the marker to appear.
+Given the 120° wide-angle lens at 2 m altitude (~7 × 5 m coverage), this
+may actually work without a sweep. However, if testing shows the camera
+can't see the disc from the takeoff position, implement one of:
+
+- **Expanding square spiral** — move in an expanding square pattern around the takeoff point.
+- **Grid sweep** — visit a grid of waypoints within the 3 m search radius.
+- **Random walk** — move to random positions within bounds (simplest but least efficient).
+
+Use `send_local_ned_position_target()` to command waypoint movements.
+
+#### PID Controller for ALIGN — Priority: MEDIUM
+
+The ALIGN state currently uses a simple proportional (P-only) controller:
+```python
+vx = Kp * y_offset
+vy = Kp * x_offset
+```
+
+This may cause oscillation if `Kp` is too high, or slow convergence if too low.
+Improve to full PID if flight testing shows instability:
+
+- **P** — proportional to offset (already implemented).
+- **I** — integral of offset over time (corrects steady-state drift from wind).
+- **D** — derivative of offset change rate (dampens oscillation).
+
+Note: The Pixhawk's internal GUIDED-mode PID also contributes damping,
+so the outer loop (our controller) may work fine as P-only. Test first.
+
+#### Precision Landing Refinement — Priority: MEDIUM
+
+The LAND state must continuously send `LANDING_TARGET` MAVLink messages
+to the Pixhawk with the marker's position in BODY_FRD frame. The frame
+conversion from camera offsets to body frame needs:
+
+```python
+target_frd = (
+    vision_target["y_offset_m"],     # camera Y → body forward
+    vision_target["x_offset_m"],     # camera X → body right
+    -telemetry["pos_z_m"]            # altitude (NED z is negative when up)
+)
+```
+
+#### Custom ROS 2 Message Type — Priority: LOW
+
+Currently using `geometry_msgs/msg/Point` with the `z` field encoding
+detection type (marker ID, probe flag, or no-detection). This works but
+is fragile. A proper approach would be a custom `.msg` definition:
+
+```
+# VisionTarget.msg
+float64 x_offset       # meters
+float64 y_offset       # meters
+int32   marker_id      # 101, 102, or 0
+bool    is_probe       # true if this is a probe detection
+float64 confidence     # 0.0–1.0
+```
+
+This requires creating a ROS 2 package with message generation. Only worth
+doing if the Simulink team builds it into their model.
+
+#### Simulink Vision Model — Priority: HIGH (parallel track)
+
+The Simulink model must be designed in MATLAB and deployed to `~/ros2_ws/`.
+It needs to:
+
+1. Capture camera frames via V4L2 (`/dev/video0`).
+2. Detect ArUco markers (IDs 101, 102) using Computer Vision Toolbox.
+3. Estimate marker pose using `solvePnP` with `config/camera_calibration.npz`.
+4. Detect probes (color/shape-based algorithm — TBD).
+5. Publish results to `/erc/vision_targets` as `geometry_msgs/msg/Point`.
+
+This is a separate development track done in MATLAB, not in this Python repo.
+Until the Simulink model is ready, use `tests/test_dummy_publisher.py` as
+a stand-in.
+
+#### Web UI / Telemetry Dashboard — Priority: LOW
+
+The old repo had a `web_ui/` module with a Flask server for real-time
+telemetry display. Evaluate whether this is needed for competition.
+The pilot already has FPV video and Mission Planner telemetry, so a
+custom dashboard may be unnecessary.

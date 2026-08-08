@@ -1,5 +1,8 @@
 # ERC 2026 Droning Sub-Task — Mission Parameters
 
+startup:
+  pixhawk_init_delay_s: 6.0    # Wait for Pixhawk heartbeat + EKF convergence after boot
+
 flight:
   takeoff_altitude_m: 2.0        # Search altitude
   search_altitude_m: 2.5         # Height for marker search sweep
