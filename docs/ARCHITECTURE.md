@@ -421,17 +421,32 @@ Every file in this repository, its purpose, and key implementation details.
 
 ### Root Files
 
-#### `main.py`
+#### `main.py` \u2705 IMPLEMENTED
 **Role:** Application entry point. Orchestrates all processes.
 
-**What it does:**
-1. Creates `multiprocessing.Queue` instances for telemetry and commands.
-2. Spawns the MAVLink communication process (`comm_process_loop` from `mavlink_node.py`).
-3. Initializes the `rclpy` vision subscriber.
-4. Runs the state machine main loop.
-5. Handles `Ctrl+C` graceful shutdown (sends LAND command, terminates processes).
+**Startup sequence (executed once):**
+1. Loads `config/mission_params.yaml` with PyYAML.
+2. Initializes ROS 2 (`rclpy.init()`). Gracefully exits if `rclpy` is not importable (ROS 2 env not sourced).
+3. Creates `multiprocessing.Queue` instances for telemetry and commands.
+4. Spawns the MAVLink comm process (`comm_process_loop` from `mavlink_node.py`) as a daemon process.
+5. Waits `startup.pixhawk_init_delay_s` seconds (default: 6s) for Pixhawk heartbeat + EKF convergence.
+6. Creates `VisionBridge` instance (subscribes to `/erc/vision_targets`).
+7. Creates `MissionController` instance (the state machine).
 
-**Key dependency:** Must be run with ROS 2 environment sourced (`source /opt/ros/jazzy/setup.bash`).
+**Main loop (runs for the entire mission):**
+```python
+while mission.state != FlightState.MISSION_DONE:
+    mission.update()    # Single call drives the entire system
+    time.sleep(0.02)    # 50 Hz
+```
+
+**Emergency stop (Ctrl+C):**
+- Sends `set_mode("LAND")` to the Pixhawk.
+- Waits 1 second for the command to be dispatched.
+- Shuts down ROS 2 and terminates the comm process.
+- Prints final probe detection report.
+
+**Key dependency:** Must be run with ROS 2 environment sourced (`source /opt/ros/jazzy/setup.bash`). Uses `sudo -E` to preserve environment while accessing UART.
 
 #### `requirements.txt`
 **Contents:** `pymavlink`, `numpy`, `pyyaml`.
@@ -493,198 +508,72 @@ This module is **copied directly from the proven old repository** (`indomitus-dr
 
 **Function: `create_command(action, **kwargs)`**
 - Helper for the state machine. Creates a command dict with an auto-injected timestamp.
-- Usage: `command_queue.put(create_command("move_local_vel", vx=0.5, vy=0.0, vz=0.0))`
-
 ---
 
 ### `src/ros_bridge/` — ROS 2 Integration Layer
 
 #### `src/ros_bridge/vision_subscriber.py` ✅ IMPLEMENTED
-**Role:** ROS 2 bridge that subscribes to `/erc/vision_targets` and provides a clean polling API to the state machine. Encapsulates all `rclpy` complexity so the state machine never imports ROS 2 directly.
-
-**Internal Class: `_VisionSubscriberNode(Node)`**
-- An internal `rclpy.Node` not exposed outside the module.
-- Creates a subscription to the configured topic with QoS queue depth 10.
+**Role:** ROS 2 bridge that subscribes to `/erc/vision_targets`.
 
 **Public Class: `VisionBridge`**
-
-*Constructor:* `VisionBridge(topic, grid_config, detection_timeout_s)`
-- `topic` — ROS 2 topic name (default: `/erc/vision_targets`).
-- `grid_config` — the `grid` section from `mission_params.yaml`. If provided, enables automatic probe-to-sector mapping.
-- `detection_timeout_s` — how many seconds before a detection is considered stale (default: 0.5s).
-
-*Key Methods:*
-- **`spin_once()`** — Non-blocking. Calls `rclpy.spin_once(node, timeout_sec=0)` to process any pending DDS messages. Must be called on every main loop iteration.
-- **`get_latest_target()`** → `dict | None` — Returns the most recent ArUco marker detection, or `None` if nothing detected or last detection is stale. Returns:
-  ```python
-  {"marker_id": 102, "x_offset_m": 0.15, "y_offset_m": -0.08, "age_s": 0.05}
-  ```
-- **`get_detected_probes()`** → `list[str]` — Returns sorted, deduplicated list of probe sector IDs (e.g., `["A2", "C4"]`).
-- **`clear_probes()`** — Resets probe accumulator (call between mission attempts).
-- **`get_message_count()`** → `int` — Total messages received (diagnostics).
-- **`shutdown()`** — Destroys the internal ROS 2 node.
-
-*Internal Callback: `_on_vision_msg(msg)`*
-- Routes based on `msg.z` value:
-  - `z = 101 or 102` → stores as latest marker target with timestamp.
-  - `z < 0` → probe detection, passes `(msg.x, msg.y)` to `GridMapper`, accumulates sector ID.
-  - `z = 0` → no detection, silently ignored.
-
-**Key design decision:** Uses `spin_once()` (non-blocking, single-threaded) instead of `rclpy.spin()` in a thread. This avoids threading + multiprocessing + serial = debugging nightmare. The main loop calls `spin_once()` at ~50 Hz, which is fast enough for 10–30 Hz vision data.
+- **`spin_once()`** — Must be called on every main loop iteration to process DDS messages.
+- **`get_latest_target()`** — Returns dictionary of ArUco marker detection (id, x, y, age).
+- **`get_detected_probes()`** — Returns sorted list of detected probe sector IDs.
 
 ---
 
 ### `src/navigation/` — Autonomous Flight Logic
 
-#### `src/navigation/state_machine.py` ⬜ NOT YET IMPLEMENTED
+#### `src/navigation/state_machine.py` ✅ IMPLEMENTED
 **Role:** The core autonomous flight state machine. Implements the Search → Align → Land mission cycle.
 
-**Planned design:**
-- **`FlightState` enum:** IDLE, TAKEOFF, SEARCH, ALIGN, LAND, COMPLETE, MISSION_DONE.
-- **`MissionController` class:** Holds references to `command_queue`, `telemetry_queue`, `VisionBridge`, and config. Exposes a single `update()` method called 50 times/second by the main loop.
-- **`update()` is NOT about changing states** — it executes the *work* for the current state (send velocity commands, check altitude, read vision) and checks if the exit condition for that state is met. Most calls return without changing state.
+**Class: `FlightState` (Enum)**
+- States: IDLE, TAKEOFF, SEARCH, ALIGN, LAND, COMPLETE, MISSION_DONE.
 
-**Per-state behavior:**
-- **IDLE:** Wait for EKF healthy + telemetry connected, then → TAKEOFF.
-- **TAKEOFF:** Arm → LOITER → GUIDED → takeoff command → monitor altitude. Condition: altitude ≥ 90% target → SEARCH. Timeout: 15s → COMPLETE (failed).
-- **SEARCH:** Hover at search altitude, check vision for marker 102. Condition: marker 102 detected → ALIGN. Timeout: 60s → LAND. (Search sweep pattern to be added later.)
-- **ALIGN:** Send velocity corrections using proportional controller: `vx = Kp * y_offset`, `vy = Kp * x_offset`. Condition: centered within 5 cm for 1 second → LAND. Lost target > 0.5s → SEARCH. Timeout: 10s → LAND.
-- **LAND:** Send `LANDING_TARGET` messages for precision landing. Condition: altitude ≈ 0 + disarmed → COMPLETE. Timeout: 15s → COMPLETE.
-- **COMPLETE:** Increment attempt counter. Attempts < 3 → IDLE. Attempts = 3 → MISSION_DONE.
+**Class: `MissionController`**
+
+*Constructor:* `MissionController(command_queue, telemetry_queue, vision_bridge, config)`
+
+*Core method: `update()`*
+- Called 50 times/second by `main.py`.
+- Refreshes telemetry, processes ROS 2 messages via `vision.spin_once()`, then dispatches to current state's handler.
+
+*State handlers:*
+
+| Handler | Work Done Each Tick | Exit Condition |
+|---------|--------------------|-----------------|
+| `_update_idle()` | Check telemetry connection + EKF health | Both healthy → TAKEOFF |
+| `_update_takeoff()` | Sequence: LOITER → ARM → GUIDED → takeoff | Alt ≥ 90% target → SEARCH. Timeout 15s → LAND |
+| `_update_search()` | Hover at altitude, poll vision for marker 102 | Marker 102 detected → ALIGN. Timeout 60s → LAND |
+| `_update_align()` | Velocity corrections: `vx = Kp * y_offset`, `vy = Kp * x_offset` | Centered < 5cm for 1s → LAND. Lost > 0.5s → SEARCH |
+| `_update_land()` | Send `LANDING_TARGET` in BODY_FRD frame | Alt ≈ 0 + disarmed → COMPLETE |
+| `_update_complete()` | Increment attempt, log probes, print report | Attempt < 3 → IDLE. Attempt = 3 → MISSION_DONE |
 
 ---
 
 ### `src/utils/` — Utility Modules
 
 #### `src/utils/grid_mapper.py` ✅ IMPLEMENTED
-**Role:** Converts probe world coordinates (x, y) in meters to competition grid sector IDs.
-
-**Class: `GridMapper`**
-
-*Constructor:* `GridMapper(grid_config)` — takes the `grid` section from `mission_params.yaml`.
-
-*Coordinate convention:*
-- X axis (North in NED) → mapped to columns (A, B, C, ...).
-- Y axis (East in NED) → mapped to rows (1, 2, 3, ...).
-- Grid origin `(origin_x_m, origin_y_m)` is the bottom-left corner of the grid, relative to the takeoff pad center.
-
-*Key Methods:*
-- **`position_to_sector(x_m, y_m)`** → `str | None` — Converts world position to sector ID (e.g., `"A2"`). Returns `None` if outside grid boundaries. Uses floor division for positions on cell boundaries.
-- **`get_grid_bounds()`** → `dict` — Returns `{x_min, x_max, y_min, y_max}` for the grid extent.
-
-**Tested:** 14 unit tests covering basic mapping, boundary cases, out-of-bounds positions, and custom configurations. All passing.
+**Role:** Converts probe world coordinates (x, y) to grid sector IDs.
 
 ---
 
 ### `config/` — Configuration Files
 
 #### `config/mission_params.yaml`
-**Role:** Single source of truth for all tunable mission parameters.
-
-**Sections:**
-- `startup` — Pixhawk initialization delay (seconds to wait for heartbeat + EKF convergence after boot).
-- `flight` — Altitudes (takeoff, search, approach), speed limits.
-- `markers` — ArUco IDs (101, 102), marker physical size, dictionary name.
-- `mission` — Number of landing attempts, search radius, success radius.
-- `grid` — Grid origin, cell size, column/row labels for probe reporting.
-- `serial` — UART port and baud rate for Pixhawk connection.
-- `ros2` — Vision topic name, DDS domain ID.
-- `timeouts` — Maximum durations for each flight phase before abort.
-
-#### `config/camera_calibration.npz`
-**Role:** NumPy archive containing the Arducam IMX708 camera intrinsic parameters.
-
-**Contents:**
-- `camera_matrix` — 3×3 intrinsic matrix (focal lengths, principal point).
-- `dist_coeffs` — Distortion coefficients.
-
-**Used by:** The Simulink vision node (for ArUco pose estimation via `solvePnP`) and potentially the grid mapper (for pixel-to-meter conversion).
-
----
-
-### `scripts/` — Operational Scripts
-
-#### `scripts/install_ros2_jazzy.sh`
-**Role:** The ERC organizers' ROS 2 Jazzy installation script for Raspberry Pi 5 / Debian 13 Trixie.
-
-**Run once:** During initial Pi setup. Creates `~/ros2_ws/`, installs `ros-jazzy-ros-base`, configures `~/.bashrc`.
-
-**Not part of normal operations.** After successful installation, this script is never run again.
-
-#### `scripts/start_mission.sh`
-**Role:** One-command mission launcher for competition day.
-
-**What it does:**
-1. Sources the ROS 2 environment.
-2. Sets `ROS_DOMAIN_ID` to avoid cross-talk.
-3. Launches `main.py` with `sudo -E` (for UART access, preserving environment).
-
-#### `scripts/run_composite_output.sh`
-**Role:** Launches the downward camera feed over the Pi's composite video output for the analog video switcher.
-
-**Copied from:** The old `indomitus-drone-ros2` repository. Used when the pilot needs to see the downward camera on their FPV monitor.
-
----
-
-### `tests/` — Test Modules
-
-#### `tests/test_dummy_publisher.py` ✅ IMPLEMENTED
-**Role:** Simulates the Simulink vision node by publishing fake target coordinates to `/erc/vision_targets` at 10 Hz.
-
-**Supports 5 simulation modes** (selected via `--mode` CLI argument):
-
-| Mode | What it simulates | Tests |
-|------|-------------------|-------|
-| `circle` (default) | Marker 102 drifting in a 0.3 m radius circle | ALIGN convergence — state machine must follow a moving target |
-| `static` | Marker 102 at a fixed (0.15, -0.10) m offset | Steady-state ALIGN + LAND transition |
-| `approach` | Marker 102 exponentially converging to center over ~10 s | Successful alignment sequence |
-| `probes-only` | Only probe detections (z = -1.0), no markers | SEARCH timeout + probe sector accumulation |
-| `intermittent` | Marker 102 visible for 3 s, gone for 2 s, repeating | Lost-target recovery (ALIGN → SEARCH → ALIGN) |
-
-**Usage:** `python3 tests/test_dummy_publisher.py --mode circle --topic /erc/vision_targets`
-
-#### `tests/test_grid_mapper.py` ✅ IMPLEMENTED
-**Role:** 14 unit tests for the `GridMapper` class. Covers basic mapping, cell boundaries, out-of-bounds positions, custom configs, and edge cases. Runs standalone or with pytest.
-
----
-
-### `docs/` — Documentation
-
-#### `docs/SETUP.md`
-**Role:** Complete Raspberry Pi 5 configuration guide. Covers OS verification, ROS 2 installation, `rclpy` setup, UART permissions, and MATLAB Blockset connection.
-
-#### `docs/ARCHITECTURE.md`
-**Role:** This file. The master architecture reference.
+**Role:** Single source of truth for all tunable parameters.
 
 ---
 
 ## 11. External Dependencies & Filesystem Layout
 
-### On the Raspberry Pi
-
-```
-/opt/ros/jazzy/                          # System-wide ROS 2 installation
-├── setup.bash                           # Environment setup script
-├── lib/python3.13/site-packages/        # rclpy, std_msgs, geometry_msgs, etc.
-└── lib/demo_nodes_cpp/                  # Talker/listener for testing
-
-/home/marko/
-├── indomitus-drone/                     # THIS REPOSITORY (git clone)
-│   └── .venv/                           # Python venv (--system-site-packages)
-├── ros2_ws/                             # ROS 2 colcon workspace
-│   ├── src/                             # Simulink-deployed C++ packages go here
-│   ├── build/                           # Compiled output
-│   └── install/                         # Runnable ROS 2 nodes
-└── ros2_jazzy_install_logs/             # Installation logs
-```
-
 ### Key Distinction
 
-| Directory | Managed By | Contains | Git-Tracked? |
-|-----------|-----------|----------|--------------|
-| `~/indomitus-drone/` | You (developer) | Python source code, configs, scripts, docs | ✅ Yes |
-| `~/ros2_ws/` | Simulink Blockset + colcon | Compiled C++ ROS 2 nodes from Simulink | ❌ No |
-| `/opt/ros/jazzy/` | APT package manager | System ROS 2 libraries | ❌ No |
+| Directory | Managed By | Git-Tracked? |
+|-----------|-----------|--------------|
+| `~/indomitus-drone/` | You (developer) | ✅ Yes |
+| `~/ros2_ws/` | Simulink Blockset | ❌ No |
+| `/opt/ros/jazzy/` | APT package manager | ❌ No |
 
 ---
 
@@ -693,112 +582,45 @@ This module is **copied directly from the proven old repository** (`indomitus-dr
 ### Competition Day Sequence
 
 ```
-Step 1: Power on Pi, SSH in as marko
-Step 2: Verify Pixhawk UART connection is live
-Step 3: Start the Simulink vision node
-           ros2 run <simulink_pkg> <node_name> &
-Step 4: Start the mission
-           cd ~/indomitus-drone
-           ./scripts/start_mission.sh
-Step 5: Operator confirms telemetry + video feed
-Step 6: Operator triggers mission start (or the script auto-starts)
-Step 7: Drone executes: Takeoff → Search → Align → Land (×3)
-Step 8: System reports probe detections
-```
-
-### Development Sequence
-
-```
-Step 1: SSH in as marko
-Step 2: source ~/.bashrc  (loads ROS 2 env)
-Step 3: cd ~/indomitus-drone && source .venv/bin/activate
-
-# Terminal 1 — Run dummy vision publisher (simulates Simulink)
-python3 tests/test_dummy_publisher.py
-
-# Terminal 2 — Run the main application
-sudo -E python3 main.py
-
-# Terminal 3 — Monitor ROS 2 topics
-ros2 topic echo /erc/vision_targets
-ros2 topic hz /erc/vision_targets
+Step 1: SSH in, verify Pixhawk UART connection
+Step 2: Start Simulink vision node
+Step 3: cd ~/indomitus-drone && ./scripts/start_mission.sh
+Step 4: System executes mission
 ```
 
 ---
 
 ## 13. Configuration Reference
 
-### ArduCopter Parameters (set via Mission Planner)
+### ArduCopter Parameters
 
-These are configured on the Pixhawk, not in this codebase, but are critical to the system:
-
-| Parameter | Value | Purpose |
-|-----------|-------|---------|
-| `SERIAL2_PROTOCOL` | 2 (MAVLink2) | Pi UART connection protocol |
-| `SERIAL2_BAUD` | 921600 | Matches Python `baudrate` |
-| `PLND_ENABLED` | 1 | Enable precision landing |
-| `PLND_TYPE` | 1 (Companion) | Landing target from companion computer |
-| `PLND_EST_TYPE` | 0 (Raw) | Use raw sensor data for landing target |
-| `FLTMODE_CH` | 5 (or configured) | RC channel for flight mode switching |
-| `GCS_TYPE` | 1 | Accept GCS heartbeats from companion |
-
-### Environment Variables
-
-| Variable | Value | Set By |
-|----------|-------|--------|
-| `MAVLINK20` | `1` | `mavlink_client.py` (in code) |
-| `ROS_DOMAIN_ID` | `42` | `start_mission.sh` |
-| `ROS_DISTRO` | `jazzy` | `~/.bashrc` (auto-set by ROS 2 setup) |
+| Parameter | Value |
+|-----------|-------|
+| `SERIAL2_PROTOCOL` | 2 |
+| `SERIAL2_BAUD` | 921600 |
+| `PLND_ENABLED` | 1 |
+| `PLND_TYPE` | 1 |
 
 ---
 
-## 14. Implementation Status & TODO
-
-### Current Status (as of 2026-08-08)
+## 14. Implementation Status (as of 2026-08-08)
 
 | File | Status | Notes |
 |------|--------|-------|
-| `src/comm/mavlink_client.py` | ✅ Complete | 580 lines, flight-tested, copied from old repo |
-| `src/comm/mavlink_node.py` | ✅ Complete | Process loop + command dispatcher, copied from old repo |
-| `src/ros_bridge/vision_subscriber.py` | ✅ Complete | VisionBridge class with marker tracking + probe accumulation |
-| `src/utils/grid_mapper.py` | ✅ Complete | GridMapper class, 14 unit tests passing |
-| `src/navigation/state_machine.py` | ⬜ Empty | Core autonomous flight logic — highest priority |
-| `main.py` | ⬜ Empty | Application entry point wiring everything together |
-| `tests/test_dummy_publisher.py` | ✅ Complete | 5 simulation modes for bench testing |
-| `tests/test_grid_mapper.py` | ✅ Complete | 14 tests, all passing |
-| `config/mission_params.yaml` | ✅ Complete | All parameters defined including startup delay |
+| `src/comm/mavlink_client.py` | ✅ Complete | Flight-tested, copied from old repo |
+| `src/comm/mavlink_node.py` | ✅ Complete | Process loop + command dispatcher |
+| `src/ros_bridge/vision_subscriber.py` | ✅ Complete | VisionBridge class |
+| `src/utils/grid_mapper.py` | ✅ Complete | GridMapper class |
+| `src/navigation/state_machine.py` | ✅ Complete | MissionController with 7 states, P-controller |
+| `main.py` | ✅ Complete | Orchestrator with 50 Hz loop |
+| `tests/test_dummy_publisher.py` | ✅ Complete | 5 simulation modes |
+| `tests/test_grid_mapper.py` | ✅ Complete | 14 tests passing |
+| `config/mission_params.yaml` | ✅ Complete | All parameters defined |
 | `docs/ARCHITECTURE.md` | ✅ Complete | This file |
-| `docs/SETUP_RASPBERRY.md` | ✅ Complete | Raspberry Pi 5 setup guide |
-| `scripts/start_mission.sh` | ✅ Complete | One-command launcher |
-| `scripts/install_ros2_jazzy.sh` | ✅ Complete | ROS 2 installer, already run successfully on Pi |
 
-### TODO — Files to Implement
+**All core Python files are implemented.** The system is ready for bench testing with the dummy publisher.
 
-#### `src/navigation/state_machine.py` — Priority: HIGH
-
-The core autonomous flight state machine. Must implement:
-
-1. **`FlightState` enum** — IDLE, TAKEOFF, SEARCH, ALIGN, LAND, COMPLETE, MISSION_DONE.
-2. **`MissionController` class** with an `update()` method called ~50 times/second.
-3. **Per-state `_update_*()` methods** — each executes the work for that state and checks exit conditions.
-4. **State transition logic** — see Section 8 for the full state diagram and transition conditions.
-5. **Telemetry refresh** — drain `telemetry_queue` on each tick, keep only the latest.
-
-#### `main.py` — Priority: HIGH
-
-The application entry point. Must implement:
-
-1. Load `config/mission_params.yaml` with PyYAML.
-2. Call `rclpy.init()`.
-3. Create `multiprocessing.Queue` instances for telemetry and commands.
-4. Spawn the MAVLink comm process (`comm_process_loop` from `mavlink_node.py`).
-5. Wait `startup.pixhawk_init_delay_s` seconds for Pixhawk connection.
-6. Create `VisionBridge` instance.
-7. Create `MissionController` instance.
-8. Run main loop at ~50 Hz: call `mission.update()` until `MISSION_DONE`.
-9. Handle `Ctrl+C` graceful shutdown: send LAND command, terminate processes.
-
-### TODO — Features to Add Later
+### TODO — Improvements to Existing Code
 
 #### Search Sweep Pattern — Priority: MEDIUM
 
@@ -831,19 +653,21 @@ Improve to full PID if flight testing shows instability:
 Note: The Pixhawk's internal GUIDED-mode PID also contributes damping,
 so the outer loop (our controller) may work fine as P-only. Test first.
 
-#### Precision Landing Refinement — Priority: MEDIUM
+#### Precision Landing Tuning — Priority: MEDIUM
 
-The LAND state must continuously send `LANDING_TARGET` MAVLink messages
-to the Pixhawk with the marker's position in BODY_FRD frame. The frame
-conversion from camera offsets to body frame needs:
+The LAND state already implements camera-to-BODY_FRD conversion and sends
+`LANDING_TARGET` messages. The axis mapping may need adjustment during
+flight testing depending on camera mounting orientation:
 
 ```python
-target_frd = (
-    vision_target["y_offset_m"],     # camera Y → body forward
-    vision_target["x_offset_m"],     # camera X → body right
-    -telemetry["pos_z_m"]            # altitude (NED z is negative when up)
-)
+# Current implementation (in state_machine.py _update_land):
+body_x = target["y_offset_m"]     # camera Y → body forward
+body_y = target["x_offset_m"]     # camera X → body right
+body_z = max(altitude, 0.1)       # altitude → body down
 ```
+
+If the drone lands consistently offset in one direction, the axis mapping
+or sign convention needs correction. Test with props off first.
 
 #### Custom ROS 2 Message Type — Priority: LOW
 
