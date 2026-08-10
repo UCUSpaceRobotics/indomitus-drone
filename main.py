@@ -155,8 +155,13 @@ def main():
         print("[MAIN] No probes detected during the mission.")
 
     # Clean up ROS 2.
-    vision.shutdown()
-    rclpy.shutdown()
+    # rclpy may already be shut down if Ctrl+C triggered an internal cleanup,
+    # so we catch the error to avoid a traceback on exit.
+    try:
+        vision.shutdown()
+        rclpy.shutdown()
+    except Exception:
+        pass  # Already shut down — that's fine.
     print("[MAIN] ROS 2 shut down.")
 
     # Clean up comm process.
