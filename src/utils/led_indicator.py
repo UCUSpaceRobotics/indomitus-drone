@@ -68,10 +68,14 @@ class LEDController:
                 # Set initial state to Green (Manual control / Standby)
                 self.set_manual_mode()
             except Exception as e:
-                print(f"[LED] Warning: Failed to initialize rpi_ws281x strip ({e}). Running in mock mode.")
+                print(f"[LED] WARNING: Failed to initialize rpi_ws281x strip ({e}). Running in mock mode.")
+                print("[LED] TROUBLESHOOTING:")
+                print("[LED]  1. Make sure to run main.py with root privileges: sudo -E python3 main.py")
+                print("[LED]  2. If using GPIO 18, disable Pi audio kernel module: echo 'blacklist snd_bcm2835' | sudo tee /etc/modprobe.d/snd-blacklist.conf")
                 self._strip = None
         else:
-            print("[LED] rpi_ws281x hardware library not available. Running in mock mode.")
+            print("[LED] rpi_ws281x Python package is NOT installed. Running in mock mode.")
+            print("[LED] Install it on Raspberry Pi via: pip install rpi_ws281x (or inside your venv).")
             # Set initial mock state to Green
             self.set_manual_mode()
 
