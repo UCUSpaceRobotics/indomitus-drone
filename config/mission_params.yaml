@@ -44,7 +44,9 @@ timeouts:
 
 led:
   enabled: true
-  gpio_pin: 18         # GPIO 18 (Physical Pin 12) - PWM0 DMA channel
+  gpio_pin: 10         # GPIO 10 (Physical Pin 19 - Hardware SPI MOSI for Raspberry Pi 5)
+  spi_bus: 0           # /dev/spidev0.0
+  spi_device: 0
   num_leds: 7          # 7-bit WS2812 5050 RGB LED ring/module
   brightness: 128      # 0-255 brightness scale (~50% brightness)
   dma_channel: 10

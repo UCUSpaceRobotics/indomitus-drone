@@ -8,7 +8,9 @@ class TestLEDController(unittest.TestCase):
     def setUp(self):
         self.config = {
             "enabled": True,
-            "gpio_pin": 18,
+            "gpio_pin": 10,
+            "spi_bus": 0,
+            "spi_device": 0,
             "num_leds": 7,
             "brightness": 128,
             "dma_channel": 10,
