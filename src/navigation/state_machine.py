@@ -65,11 +65,12 @@ class MissionController:
     # How long the marker can be missing before we consider it lost (seconds).
     ALIGN_LOST_TIMEOUT_S = 0.5
 
-    def __init__(self, command_queue, telemetry_queue, vision_bridge, config: dict):
+    def __init__(self, command_queue, telemetry_queue, vision_bridge, config: dict, led_indicator=None):
         self.cmd_q = command_queue
         self.telem_q = telemetry_queue
         self.vision = vision_bridge
         self.config = config
+        self.led = led_indicator
 
         # Current state.
         self.state = FlightState.IDLE
@@ -104,6 +105,7 @@ class MissionController:
 
         print(f"[STATE] MissionController initialized. Target: {self.num_landings} landings.")
         print(f"[STATE] Starting in {self.state.value}")
+        self._update_led_indicator()
 
     # ==================================================================
     # Public API
@@ -117,6 +119,7 @@ class MissionController:
             1. Refreshes telemetry from the comm process queue.
             2. Processes pending ROS 2 vision messages.
             3. Dispatches to the handler for the current state.
+            4. Updates the LED indicator state.
         """
         self._refresh_telemetry()
         self.vision.spin_once()
@@ -134,6 +137,27 @@ class MissionController:
         elif self.state == FlightState.COMPLETE:
             self._update_complete()
         # MISSION_DONE: do nothing, main loop will exit.
+
+        self._update_led_indicator()
+
+    def _update_led_indicator(self):
+        """Update LED indicator (Green = Manual control, Red = Autonomous execution)."""
+        if self.led is None:
+            return
+
+        is_autonomous_state = self.state in (
+            FlightState.TAKEOFF,
+            FlightState.SEARCH,
+            FlightState.ALIGN,
+            FlightState.LAND,
+        )
+
+        mode = self.telem.get("mode", "GUIDED") if self.telem else "GUIDED"
+        is_manual_mode = mode in ("LOITER", "ALT_HOLD", "STABILIZE", "POSHOLD", "RTL", "MANUAL")
+
+        # Autonomous execution requires autonomous state AND active guided mode
+        is_autonomous = is_autonomous_state and not is_manual_mode
+        self.led.update_state(is_autonomous)
 
     # ==================================================================
     # State handlers

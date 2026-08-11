@@ -41,3 +41,13 @@ timeouts:
   search_sweep_s: 60.0
   alignment_s: 10.0
   landing_s: 15.0
+
+led:
+  enabled: true
+  gpio_pin: 18         # GPIO 18 (Physical Pin 12) - PWM0 DMA channel
+  num_leds: 7          # 7-bit WS2812 5050 RGB LED ring/module
+  brightness: 128      # 0-255 brightness scale (~50% brightness)
+  dma_channel: 10
+  colors:
+    manual: [0, 255, 0]      # Green for manual control / standby
+    autonomous: [255, 0, 0]  # Red for autonomy execution

@@ -99,7 +99,14 @@ def main():
     time.sleep(init_delay)
 
     # ------------------------------------------------------------------
-    # 6. Create the VisionBridge (ROS 2 subscriber)
+    # 6. Initialize LED Indicator
+    # ------------------------------------------------------------------
+    from src.utils.led_indicator import LEDController
+
+    led = LEDController(config.get("led", {}))
+
+    # ------------------------------------------------------------------
+    # 7. Create the VisionBridge (ROS 2 subscriber)
     # ------------------------------------------------------------------
     from src.ros_bridge.vision_subscriber import VisionBridge
 
@@ -110,7 +117,7 @@ def main():
     print("[MAIN] VisionBridge created — subscribed to vision topic.")
 
     # ------------------------------------------------------------------
-    # 7. Create the MissionController (state machine)
+    # 8. Create the MissionController (state machine)
     # ------------------------------------------------------------------
     from src.navigation.state_machine import MissionController, FlightState
 
@@ -119,11 +126,12 @@ def main():
         telemetry_queue=telemetry_queue,
         vision_bridge=vision,
         config=config,
+        led_indicator=led,
     )
     print("[MAIN] MissionController created — state machine ready.")
 
     # ------------------------------------------------------------------
-    # 8. Main loop
+    # 9. Main loop
     # ------------------------------------------------------------------
     print()
     print("[MAIN] Entering main loop (50 Hz).")
@@ -143,7 +151,7 @@ def main():
         time.sleep(1.0)
 
     # ------------------------------------------------------------------
-    # 9. Shutdown
+    # 10. Shutdown
     # ------------------------------------------------------------------
     print("\n[MAIN] Shutting down...")
 
@@ -153,6 +161,10 @@ def main():
         print(f"[MAIN] FINAL PROBE REPORT: {', '.join(probes)}")
     else:
         print("[MAIN] No probes detected during the mission.")
+
+    # Clean up LED indicator.
+    if led:
+        led.close()
 
     # Clean up ROS 2.
     # rclpy may already be shut down if Ctrl+C triggered an internal cleanup,
