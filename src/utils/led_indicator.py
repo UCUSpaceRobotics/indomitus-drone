@@ -39,6 +39,19 @@ class SPIWS2812Driver:
         self.spi.max_speed_hz = speed_hz
         self.spi.mode = 0
 
+        # Send initial reset pulse to clear WS2812 shift register
+        reset_buf = b"\x00" * 100
+        self._write_raw(reset_buf)
+
+    def _write_raw(self, data: bytes | bytearray) -> None:
+        """Write raw byte buffer to SPI hardware."""
+        if hasattr(self.spi, "writebytes2"):
+            self.spi.writebytes2(data)
+        elif hasattr(self.spi, "writebytes"):
+            self.spi.writebytes(list(data))
+        else:
+            self.spi.xfer2(list(data))
+
     def write_pixels(self, num_leds: int, r: int, g: int, b: int) -> None:
         """Serialize WS2812 GRB bits to SPI bytes at 6.4 MHz.
 
@@ -53,11 +66,14 @@ class SPIWS2812Driver:
                     tx_buf.append(0xFC if bit else 0xC0)
 
         # Append latch reset pulse (>50us LOW)
-        tx_buf.extend(b"\x00" * 60)
-        self.spi.xfer2(list(tx_buf))
+        tx_buf.extend(b"\x00" * 80)
+        self._write_raw(tx_buf)
 
     def close(self) -> None:
         try:
+            # Send black (all off) before closing
+            reset_buf = b"\x00" * 100
+            self._write_raw(reset_buf)
             self.spi.close()
         except Exception:
             pass
@@ -100,10 +116,10 @@ class LEDController:
                 self._spi_driver = SPIWS2812Driver(self.spi_bus, self.spi_device)
                 self._driver_type = "spidev"
                 print(f"[LED] Initialized WS2812 via SPI (/dev/spidev{self.spi_bus}.{self.spi_device}) on GPIO {self.gpio_pin} (Pi 5 ready).")
-                self.set_manual_mode()
+                self.set_manual_mode(force=True)
                 return
             except Exception as e:
-                print(f"[LED] SPI initialization failed ({e}). Falling back to rpi_ws281x.")
+                print(f"[LED] SPI initialization failed ({e}). Check if SPI is enabled in raspi-config.")
 
         # Attempt 2: Legacy rpi_ws281x Driver (Raspberry Pi 3/4)
         if HAS_RPI_WS281X:
@@ -121,22 +137,22 @@ class LEDController:
                 self._ws281x_strip.begin()
                 self._driver_type = "rpi_ws281x"
                 print(f"[LED] Initialized WS2812 via rpi_ws281x on GPIO {self.gpio_pin}.")
-                self.set_manual_mode()
+                self.set_manual_mode(force=True)
                 return
             except Exception as e:
                 print(f"[LED] rpi_ws281x initialization failed ({e}).")
 
         # Fallback: Mock Mode
         print("[LED] Hardware LED drivers not available. Running in mock mode.")
-        self.set_manual_mode()
+        self.set_manual_mode(force=True)
 
-    def set_color(self, r: int, g: int, b: int) -> None:
+    def set_color(self, r: int, g: int, b: int, force: bool = False) -> None:
         """Set all LEDs to the specified RGB color with brightness scaling.
 
         Uses state caching to prevent redundant SPI/DMA hardware transfers.
         """
         color_tuple = (r, g, b)
-        if color_tuple == self._current_color:
+        if not force and color_tuple == self._current_color:
             return  # Color hasn't changed — skip hardware write for 0 CPU load.
 
         self._current_color = color_tuple
@@ -158,15 +174,15 @@ class LEDController:
 
         print(f"[LED] Color updated: RGB({r}, {g}, {b}) [{self._driver_type}]")
 
-    def set_manual_mode(self) -> None:
+    def set_manual_mode(self, force: bool = False) -> None:
         """Set LED indicator to Green (Manual control / Standby)."""
         r, g, b = self.color_manual
-        self.set_color(r, g, b)
+        self.set_color(r, g, b, force=force)
 
-    def set_autonomous_mode(self) -> None:
+    def set_autonomous_mode(self, force: bool = False) -> None:
         """Set LED indicator to Red (Autonomy execution)."""
         r, g, b = self.color_autonomous
-        self.set_color(r, g, b)
+        self.set_color(r, g, b, force=force)
 
     def update_state(self, is_autonomous: bool) -> None:
         """Update LED mode based on autonomy status flag."""
