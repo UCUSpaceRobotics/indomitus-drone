@@ -169,7 +169,7 @@ class SquareFlightController:
         current_mode = self.telem.get("mode", "UNKNOWN")
 
         # In TAKEOFF phase 0-1, we deliberately use LOITER to arm.
-        if self.state == SquareFlightState.TAKEOFF and self._takeoff_phase <= 1:
+        if self.state == SquareFlightState.TAKEOFF and self._takeoff_phase <= 3:
             return False
 
         # If we are in an autonomous flight state and mode is NOT GUIDED, pilot took over.
