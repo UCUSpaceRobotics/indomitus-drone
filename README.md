@@ -30,6 +30,9 @@ Autonomous quadcopter system for the **European Rover Challenge 2026 — Droning
 source /opt/ros/jazzy/setup.bash
 source ~/ros2_ws/install/setup.bash
 
+source ~/.bashrc           # loads ROS 2 Jazzy environment
+source .venv/bin/activate  # activates the Python venv
+
 # 2. Run the mission
 cd ~/indomitus-drone
 sudo -E python3 main.py
