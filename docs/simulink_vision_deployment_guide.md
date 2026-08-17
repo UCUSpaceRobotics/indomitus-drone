@@ -48,16 +48,17 @@ Whenever the Raspberry Pi restarts, follow these steps across 3 terminals:
 The Raspberry Pi 5 uses `libcamera`/`rpicam` for CSI cameras. Simulink requires a standard V4L2 device. We use `v4l2loopback` with GStreamer to bridge the two:
 
 ```bash
-# 1. Load the loopback kernel module
-sudo modprobe v4l2loopback video_nr=10 card_label="SimulinkCam" exclusive_caps=1
+# 1. Load the loopback kernel module (creates /dev/video10 and /dev/video11)
+sudo modprobe v4l2loopback video_nr=10,11 card_label="SimulinkCam","WebStreamCam" exclusive_caps=1,1
 
-# 2. Start the streaming pipeline (keep this running)
+# 2. Start the streaming pipeline with dual outputs (tee)
 rpicam-vid --width 640 --height 480 --framerate 15 \
     --codec yuv420 --output - --timeout 0 | \
     gst-launch-1.0 fdsrc ! \
     rawvideoparse width=640 height=480 format=i420 framerate=15/1 ! \
-    videoconvert ! video/x-raw,format=YUY2 ! \
-    v4l2sink device=/dev/video10
+    videoconvert ! video/x-raw,format=YUY2 ! tee name=t \
+    t. ! queue ! v4l2sink device=/dev/video10 \
+    t. ! queue ! v4l2sink device=/dev/video11
 ```
 > [!IMPORTANT]
 > The format **MUST be `format=YUY2`**. MathWorks' V4L2 capture code specifically queries for `V4L2_PIX_FMT_YUYV` (`YUY2` in GStreamer). If set to `RGB`, the node will fail with `Invalid argument` during resolution validation.

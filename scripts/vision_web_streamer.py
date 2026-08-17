@@ -65,8 +65,8 @@ def ros_spin_thread():
 
 # ── Camera Capture & Overlay Loop ──────────────────────────────────────────
 def camera_thread():
-    print("[CAMERA] Initializing capture from /dev/video10...")
-    cap = cv2.VideoCapture("/dev/video10", cv2.CAP_V4L2)
+    print("[CAMERA] Initializing capture from /dev/video11...")
+    cap = cv2.VideoCapture("/dev/video11", cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
