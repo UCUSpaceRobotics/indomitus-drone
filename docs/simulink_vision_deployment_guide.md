@@ -108,7 +108,45 @@ z: 0.0
 
 ---
 
-## 3. One-Time System Setup & Prerequisites
+## 3. Live Web Video Visualizer (Dual-Output Stream)
+
+Because `/dev/video10` is locked exclusively by the Simulink node during memory mapping (MMAP), GStreamer uses a `tee` element to duplicate the live camera stream into a second virtual device (`/dev/video11`).
+
+This allows the **Python Web Streamer** (`scripts/vision_web_streamer.py`) to run simultaneously with the **Simulink vision node** without buffer contention.
+
+```
+                  ┌──────────────► /dev/video10 ──► erc_vision_node (Simulink)
+rpicam-vid ──► tee
+                  └──────────────► /dev/video11 ──► vision_web_streamer.py ──► Browser (:5000)
+```
+
+### Starting the Visualizer (Terminal 3 or 4)
+
+```bash
+cd ~/indomitus-drone
+source /opt/ros/jazzy/setup.bash
+source .venv/bin/activate
+export ROS_DOMAIN_ID=42
+
+python3 scripts/vision_web_streamer.py
+```
+
+### Viewing in Browser:
+Open in Chrome, Edge, or Firefox on your laptop:
+```
+http://10.20.18.63:5000
+```
+
+### Features Displayed on the Live HUD:
+- **Center Reticle & Crosshairs:** Shows the optical center (drone center).
+- **ArUco Detection Outlines:** Green/yellow bounding boxes around detected markers with IDs.
+- **Simulink Target Status:** Displays `SEARCHING...` vs `TARGET ACQUIRED`.
+- **Real-Time Offsets:** Numerical `X Offset` (meters right) and `Y Offset` (meters forward).
+- **Target Vector Arrow:** Green vector arrow dynamically pointing from the drone center to the target.
+
+---
+
+## 4. One-Time System Setup & Prerequisites
 
 If setting up a fresh Raspberry Pi 5 from scratch:
 
@@ -128,7 +166,7 @@ r = raspi('10.20.18.63', 'marko', 'your_password')
 
 ---
 
-## 4. Upstream Bug Explanation & Code Patch
+## 5. Upstream Bug Explanation & Code Patch
 
 ### The Bug (Empty Scene Segfault)
 When generating C++ code from `[ids, ~, poses] = readArucoMarker(...)`, MATLAB Coder produces an unchecked conversion from raw rotation/translation matrices to `rigidtform3d` structs:
@@ -183,7 +221,7 @@ colcon build --packages-select erc_vision_node
 
 ---
 
-## 5. How to Fix the Simulink Model Directly
+## 6. How to Fix the Simulink Model Directly
 
 To avoid needing any manual C++ patches in the future, modify the `detectAndEstimate` MATLAB Function block in Simulink:
 
@@ -270,7 +308,7 @@ end
 
 ---
 
-## 6. Integration with Python Mission Controller (`main.py`)
+## 7. Integration with Python Mission Controller (`main.py`)
 
 The Python state machine connects to the Simulink node via `VisionBridge` (`src/ros_bridge/vision_subscriber.py`):
 
@@ -315,7 +353,7 @@ rclpy.shutdown()
 
 ---
 
-## 7. Future Work & Enhancements
+## 8. Future Work & Enhancements
 
 1. **Lens Calibration (Crucial for Flight Precision):**
    - Calibrate the actual Arducam IMX708 using MATLAB's `cameraCalibrator` app with a 9×7 checkerboard.
