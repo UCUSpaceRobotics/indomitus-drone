@@ -181,7 +181,9 @@ class VisionBridge:
         if marker_id in (MARKER_ID_ORIGIN, MARKER_ID_LANDING):
             # ArUco marker detection.
             self._latest_marker_id = marker_id
-            self._latest_x = msg.x
+            # Negate X: camera is mounted with X-axis inverted relative
+            # to the drone's right direction.
+            self._latest_x = -msg.x
             self._latest_y = msg.y
             self._last_detection_time = time.time()
 
