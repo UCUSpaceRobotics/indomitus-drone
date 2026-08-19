@@ -503,7 +503,7 @@ class PixhawkClient:
             f"[COMM] Command sent: VELOCITY [vx:{vx_m_s}, vy:{vy_m_s}, vz:{vz_m_s}] m/s"
         )
 
-    def land_on_target(
+    def send_landing_target(
         self,
         target: tuple[float, float, float],
         initiate_landing: bool = False,

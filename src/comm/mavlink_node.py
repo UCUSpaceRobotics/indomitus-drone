@@ -161,6 +161,14 @@ def dispatch_command(client, cmd):
             return
 
         client.land_on_target(tuple(target))
+    elif action == "send_landing_target":
+        target = cmd.get("target")
+
+        if target is None:
+            print("[COMM_NODE] ERROR: send_landing_target command has no target")
+            return
+
+        client.send_landing_target(tuple(target), cmd.get("initiate_landing", False))
     else:
         print(f"[COMM_NODE] ERROR: Unknown command action: {action}")
 
