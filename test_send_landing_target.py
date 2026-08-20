@@ -26,27 +26,27 @@ def main():
     time.sleep(6) # Трохи збільшений час для стабілізації потоків даних при старті
 
     try:
-        # 2. Перехід у LOITER для надійного армінгу
+        # 1. Перехід у LOITER для надійного армінгу
         print("\n>>> КРОК 1: Перехід у режим LOITER...")
         command_queue.put(create_command("set_mode", mode="LOITER"))
         time.sleep(3)
 
-        # 3. Армінг (Запуск моторів)
+        # 2. Армінг (Запуск моторів)
         print("\n>>> КРОК 2: Запит на ARMING (Запуск моторів)...")
         command_queue.put(create_command("arm", state=True))
         time.sleep(4)
 
-        # 3.5. Перехід у GUIDED ВЖЕ ПІСЛЯ армінгу
+        # 2.5. Перехід у GUIDED ВЖЕ ПІСЛЯ армінгу
         print("\n>>> КРОК 2.5: Перехід у режим GUIDED...")
         command_queue.put(create_command("set_mode", mode="GUIDED"))
         time.sleep(2)
 
-        # 4. Зліт (Тестовий)
+        # 3. Зліт (Тестoвий)
         TARGET_ALTITUDE = 2.0
         print(f"\n>>> КРОК 3: Команда TAKEOFF (Зліт на {TARGET_ALTITUDE} метри)...")
         command_queue.put(create_command("takeoff", altitude=TARGET_ALTITUDE))
 
-        # 4.5. Очікування досягнення цільової висоти (до 20 секунд)
+        # 3.5. Очікування досягнення цільової висоти (до 20 секунд)
         ALTITUDE_REACH_TIMEOUT = 15.0
         reached_target_altitude = False
         print(f"\n>>> КРОК 3.5: Очікування досягнення {TARGET_ALTITUDE}м (таймаут {ALTITUDE_REACH_TIMEOUT}с)...")
@@ -78,7 +78,7 @@ def main():
             time.sleep(2)
             return
 
-        # 5. Моніторинг польоту / висіння у повітрі
+        # 4. Моніторинг польоту / висіння у повітрі
         FLIGHT_DURATION = 7.0  # Час висіння у секундах
         print(f"\n>>> КРОК 4: Моніторинг телеметрії у польоті ({FLIGHT_DURATION} секунд)...")
         start_time = time.time()
@@ -103,20 +103,20 @@ def main():
 
             time.sleep(0.2) # Оновлення 5 разів на секунду
 
-        # 6.5 Рух 1м вперед (по осі X у локальній системі координат)
-        print("\n>>> КРОК 5: Відправка LANDING TARGET (1м вперед, по осі X у локальній системі координат)...")
-        command_queue.put(create_command("send_landing_target", target=(1.0, -1.0, TARGET_ALTITUDE), initiate_landing=False))
-        print("\n>>> КРОК 6: Рух на 1 метр вперед (по осі X у локальній системі координат)...")
+        # 5 Рух 1м вперед (по осі X у локальній системі координат)
+        print("\n>>> КРОК 5: Рух на 1 метр вперед (по осі X у локальній системі координат)...")
         command_queue.put(create_command("move_local_pos", dx=1.0, dy=0.0, dz=0.0))
         time.sleep(3) # Час на виконання руху
 
-        # 7. Моніторинг польоту / висіння у повітрі
+        # 6. Моніторинг польоту / висіння у повітрі
         FLIGHT_DURATION = 3.0  # Час висіння у секундах
-        print(f"\n>>> КРОК 7: Моніторинг телеметрії у польоті ({FLIGHT_DURATION} секунд)...")
+        print(f"\n>>> КРОК 6: Моніторинг телеметрії у польоті ({FLIGHT_DURATION} секунд)...")
+        print("\n>>>        : Відправка LANDING TARGET (1м вперед, по осі X у локальній системі координат)...")
         start_time = time.time()
 
         while (time.time() - start_time) < FLIGHT_DURATION:
             try:
+                command_queue.put(create_command("send_landing_target", target=(1.0, -1.0, TARGET_ALTITUDE), initiate_landing=False))
                 # Дістаємо найсвіжіший словник телеметрії
                 telem = telemetry_queue.get(timeout=0.1)
 
