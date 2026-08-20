@@ -62,7 +62,7 @@ def main():
                 sys.stdout.write(f"\r[НАБІР ВИСОТИ] Режим: {mode:^8} | Арм: {armed:^3} | Висота: {alt_m:>5.2f}м | Батарея: {batt:>5.1f}V ")
                 sys.stdout.flush()
 
-                if alt_m >= TARGET_ALTITUDE * 0.9:  # Дозволяємо невелике відхилення
+                if alt_m >= TARGET_ALTITUDE * 0.85:  # Дозволяємо невелике відхилення
                     reached_target_altitude = True
                     break
             except queue.Empty:
