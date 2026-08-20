@@ -42,7 +42,7 @@ def main():
         time.sleep(2)
 
         # 4. Зліт (Тестовий)
-        TARGET_ALTITUDE = 1.0
+        TARGET_ALTITUDE = 2.0
         print(f"\n>>> КРОК 3: Команда TAKEOFF (Зліт на {TARGET_ALTITUDE} метри)...")
         command_queue.put(create_command("takeoff", altitude=TARGET_ALTITUDE))
 
@@ -104,8 +104,9 @@ def main():
             time.sleep(0.2) # Оновлення 5 разів на секунду
 
         # 6.5 Рух 1м вперед (по осі X у локальній системі координат)
+        print("\n>>> КРОК 5: Відправка LANDING TARGET (1м вперед, по осі X у локальній системі координат)...")
+        command_queue.put(create_command("send_landing_target", target=(1.0, -1.0, TARGET_ALTITUDE), initiate_landing=False))
         print("\n>>> КРОК 6: Рух на 1 метр вперед (по осі X у локальній системі координат)...")
-        command_queue.put(create_command("send_landing_target", target=(1.0, -1.0, 0.0), initiate_landing=False))
         command_queue.put(create_command("move_local_pos", dx=1.0, dy=0.0, dz=0.0))
         time.sleep(3) # Час на виконання руху
 
