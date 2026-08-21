@@ -82,6 +82,7 @@ class MissionController:
         self.timeout_takeoff = config["timeouts"]["takeoff_s"]
         self.timeout_search = config["timeouts"]["search_sweep_s"]
         self.timeout_descend = config["timeouts"]["landing_s"]
+        self.timeout_alignment = config["timeouts"]["alignment_s"]
 
         # Flight parameters.
         self.takeoff_alt = config["flight"]["takeoff_altitude_m"]
@@ -92,7 +93,7 @@ class MissionController:
 
         # TAKEOFF sub-phase tracking.
         self._takeoff_phase = 0  # 0=loiter, 1=arm, 2=guided, 3=takeoff_cmd, 4=climbing
-        self._takeoff_cmd_time = 0.0
+        self._takeoff_cmd_time = time.time()
 
         # SEARCH state tracking (consecutive detection debounce).
         self._search_detect_ticks = 0
@@ -101,7 +102,7 @@ class MissionController:
         self._land_cmd_sent = False
 
         self._search_phase = 0  # 0=hover, 1=hover forward, 2=searching
-        self._initiate_movement_time = 0.0  # Time when movement command was sent
+        self._initiate_movement_time = time.time()  # Time when movement command was sent
         self._search_attempts = 0  # Count of search attempts (hover forward cycles)
 
         print("[STATE] MissionController initialized - single mission run.")
@@ -280,7 +281,7 @@ class MissionController:
 
         if self._search_phase == 0:
             # Phase 0: Hover in place (no movement commands).
-            if time.time() - self._takeoff_cmd_time >= 5.0:
+            if time.time() - self.state_entry_time >= 5.0:
                 print("[STATE] Hover in place for 5 seconds.")
                 self._search_phase = 1
         elif self._search_phase == 1:
@@ -294,12 +295,12 @@ class MissionController:
             self._send("move_local_pos", dx=1.0, dy=0.0, dz=0.0)  # Maintain hover.
             print("[STATE] Hovering forward 1m, waiting for marker detection...")
             self._initiate_movement_time = time.time()
+            self._search_attempts += 1
             self._search_phase = 2  # Move to phase 2 to wait for hover completion.
         elif self._search_phase == 2:
             # Phase 2: Maintain hover and check for marker detection.
-            if time.time() - self._initiate_movement_time >= 10.0:
+            if time.time() - self._initiate_movement_time >= self.timeout_alignment:
                 print("[STATE] Hovering forward 1m complete, continuing search...")
-                self._search_attempts += 1
                 self._search_phase = 1  # Loop back to maintain hover.
 
 
@@ -307,6 +308,8 @@ class MissionController:
         target = self.vision.get_latest_target()
         if target is not None and target["marker_id"] == self.landing_target_id:
             self._search_detect_ticks += 1
+            self._send("send_landing_target", target=[target["x_offset_m"], target["y_offset_m"], self._get_altitude()])
+            print(f"[STATE] Landing target detected at offset ({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m")
             if self._search_detect_ticks >= self.SEARCH_CONFIRM_TICKS:
                 print(
                     f"[STATE] Landing target CONFIRMED ({self._search_detect_ticks} frames) at offset "
@@ -365,8 +368,8 @@ class MissionController:
             # Camera Y offset (forward) -> body X (forward)
             # Camera X offset (right)   -> body Y (right)
             # Altitude                  -> body Z (down) - must be positive
-            body_x = target["y_offset_m"]     # Forward.
-            body_y = target["x_offset_m"]     # Right.
+            body_x = target["x_offset_m"]     # Forward.
+            body_y = target["y_offset_m"]     # Right.
             body_z = max(altitude, 0.1)       # Down (altitude, clamped to avoid z=0 error).
 
             if not self._land_cmd_sent:
