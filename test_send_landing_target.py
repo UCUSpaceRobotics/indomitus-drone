@@ -42,7 +42,7 @@ def main():
         time.sleep(2)
 
         # 3. Зліт (Тестoвий)
-        TARGET_ALTITUDE = 2.0
+        TARGET_ALTITUDE = 1.0
         print(f"\n>>> КРОК 3: Команда TAKEOFF (Зліт на {TARGET_ALTITUDE} метри)...")
         command_queue.put(create_command("takeoff", altitude=TARGET_ALTITUDE))
 
@@ -81,10 +81,13 @@ def main():
         # 4. Моніторинг польоту / висіння у повітрі
         FLIGHT_DURATION = 7.0  # Час висіння у секундах
         print(f"\n>>> КРОК 4: Моніторинг телеметрії у польоті ({FLIGHT_DURATION} секунд)...")
+        print("\n>>>        : Відправка LANDING TARGET (1м вперед, по осі X у локальній системі координат)...")
         start_time = time.time()
 
         while (time.time() - start_time) < FLIGHT_DURATION:
             try:
+                command_queue.put(create_command("send_landing_target", target=(2.0, 2.0, TARGET_ALTITUDE), initiate_landing=False))
+
                 # Дістаємо найсвіжіший словник телеметрії
                 telem = telemetry_queue.get(timeout=0.1)
 
@@ -111,12 +114,10 @@ def main():
         # 6. Моніторинг польоту / висіння у повітрі
         FLIGHT_DURATION = 3.0  # Час висіння у секундах
         print(f"\n>>> КРОК 6: Моніторинг телеметрії у польоті ({FLIGHT_DURATION} секунд)...")
-        print("\n>>>        : Відправка LANDING TARGET (1м вперед, по осі X у локальній системі координат)...")
         start_time = time.time()
 
         while (time.time() - start_time) < FLIGHT_DURATION:
             try:
-                command_queue.put(create_command("send_landing_target", target=(1.0, -1.0, TARGET_ALTITUDE), initiate_landing=False))
                 # Дістаємо найсвіжіший словник телеметрії
                 telem = telemetry_queue.get(timeout=0.1)
 

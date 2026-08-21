@@ -271,71 +271,71 @@ class MissionController:
                 f"[STATE] Landing target DETECTED at offset "
                 f"({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m"
             )
-            self._transition_to(FlightState.ALIGN)
-
-    def _update_align(self):
-        """ALIGN: Center the drone over the landing target using velocity corrections.
-
-        Control law (proportional):
-            vx = Kp * y_offset   (camera Y → body forward)
-            vy = Kp * x_offset   (camera X → body right)
-
-        Transition to LAND when centered within threshold for 1 full second.
-        Fall back to SEARCH if the marker is lost for > 0.5 seconds.
-        """
-        elapsed = time.time() - self.state_entry_time
-
-        # Timeout — land anyway (imprecise landing is better than no landing).
-        if elapsed > self.timeout_align:
-            print("[STATE] ALIGN TIMEOUT — landing at current position.")
             self._transition_to(FlightState.LAND)
-            return
 
-        target = self.vision.get_latest_target()
+    # def _update_align(self):
+    #     """ALIGN: Center the drone over the landing target using velocity corrections.
 
-        # Lost target check.
-        if target is None or target["marker_id"] != self.landing_target_id:
-            if target is None:
-                # Check if we've been without a detection for too long.
-                self._centered_ticks = 0
-                # Vision bridge returns None when detection age > 0.5s,
-                # so if we get None, the marker has been gone long enough.
-                print("[STATE] Marker lost — returning to SEARCH.")
-                self._transition_to(FlightState.SEARCH)
-                return
-            # Detected a different marker (e.g., 101) — ignore it, keep aligning.
-            return
+    #     Control law (proportional):
+    #         vx = Kp * y_offset   (camera Y → body forward)
+    #         vy = Kp * x_offset   (camera X → body right)
 
-        # Calculate velocity corrections.
-        x_offset = target["x_offset_m"]  # Right of camera center.
-        y_offset = target["y_offset_m"]  # Forward of camera center.
+    #     Transition to LAND when centered within threshold for 1 full second.
+    #     Fall back to SEARCH if the marker is lost for > 0.5 seconds.
+    #     """
+    #     elapsed = time.time() - self.state_entry_time
 
-        vx = self.ALIGN_KP * y_offset   # Forward/back body velocity.
-        vy = self.ALIGN_KP * x_offset   # Left/right body velocity.
-        vz = 0.0                         # Hold altitude.
+    #     # Timeout — land anyway (imprecise landing is better than no landing).
+    #     if elapsed > self.timeout_align:
+    #         print("[STATE] ALIGN TIMEOUT — landing at current position.")
+    #         self._transition_to(FlightState.LAND)
+    #         return
 
-        # Clamp velocities to configured max.
-        max_speed = self.config["flight"]["max_horizontal_speed_m_s"]
-        vx = max(-max_speed, min(max_speed, vx))
-        vy = max(-max_speed, min(max_speed, vy))
+    #     target = self.vision.get_latest_target()
 
-        # Send velocity command (must be sent continuously at high rate).
-        self._send("move_local_vel", vx=vx, vy=vy, vz=vz)
+    #     # Lost target check.
+    #     if target is None or target["marker_id"] != self.landing_target_id:
+    #         if target is None:
+    #             # Check if we've been without a detection for too long.
+    #             self._centered_ticks = 0
+    #             # Vision bridge returns None when detection age > 0.5s,
+    #             # so if we get None, the marker has been gone long enough.
+    #             print("[STATE] Marker lost — returning to SEARCH.")
+    #             self._transition_to(FlightState.SEARCH)
+    #             return
+    #         # Detected a different marker (e.g., 101) — ignore it, keep aligning.
+    #         return
 
-        # Check if centered.
-        error = math.sqrt(x_offset ** 2 + y_offset ** 2)
-        if error < self.ALIGN_CENTERED_THRESHOLD_M:
-            self._centered_ticks += 1
-        else:
-            self._centered_ticks = 0
+    #     # Calculate velocity corrections.
+    #     x_offset = target["x_offset_m"]  # Right of camera center.
+    #     y_offset = target["y_offset_m"]  # Forward of camera center.
 
-        # Stable for long enough — transition to LAND.
-        if self._centered_ticks >= self.ALIGN_CENTERED_TICKS_REQUIRED:
-            print(
-                f"[STATE] ALIGNED — centered within {self.ALIGN_CENTERED_THRESHOLD_M}m "
-                f"for {self.ALIGN_CENTERED_TICKS_REQUIRED / 50:.1f}s. Initiating landing."
-            )
-            self._transition_to(FlightState.LAND)
+    #     vx = self.ALIGN_KP * y_offset   # Forward/back body velocity.
+    #     vy = self.ALIGN_KP * x_offset   # Left/right body velocity.
+    #     vz = 0.0                         # Hold altitude.
+
+    #     # Clamp velocities to configured max.
+    #     max_speed = self.config["flight"]["max_horizontal_speed_m_s"]
+    #     vx = max(-max_speed, min(max_speed, vx))
+    #     vy = max(-max_speed, min(max_speed, vy))
+
+    #     # Send velocity command (must be sent continuously at high rate).
+    #     self._send("move_local_vel", vx=vx, vy=vy, vz=vz)
+
+    #     # Check if centered.
+    #     error = math.sqrt(x_offset ** 2 + y_offset ** 2)
+    #     if error < self.ALIGN_CENTERED_THRESHOLD_M:
+    #         self._centered_ticks += 1
+    #     else:
+    #         self._centered_ticks = 0
+
+    #     # Stable for long enough — transition to LAND.
+    #     if self._centered_ticks >= self.ALIGN_CENTERED_TICKS_REQUIRED:
+    #         print(
+    #             f"[STATE] ALIGNED — centered within {self.ALIGN_CENTERED_THRESHOLD_M}m "
+    #             f"for {self.ALIGN_CENTERED_TICKS_REQUIRED / 50:.1f}s. Initiating landing."
+    #         )
+    #         self._transition_to(FlightState.LAND)
 
     def _update_land(self):
         """LAND: Execute precision landing using LANDING_TARGET messages.

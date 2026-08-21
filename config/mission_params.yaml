@@ -1,30 +1,85 @@
-# ERC 2026 Droning Sub-Task — Mission Parameters
-
-startup:
-  pixhawk_init_delay_s: 6.0    # Wait for Pixhawk heartbeat + EKF convergence after boot
+# ERC 2026 Droning Sub-Task — validated lifecycle parameters.
+# Route and motion tuning still require SITL and props-removed validation.
 
 flight:
-  takeoff_altitude_m: 2.0        # Search altitude
-  search_altitude_m: 2.5         # Height for marker search sweep
-  landing_approach_altitude_m: 1.0
+  takeoff_altitude_m: 2.0
+  takeoff_reached_ratio: 0.9
   max_horizontal_speed_m_s: 0.5
   max_vertical_speed_m_s: 0.3
 
 markers:
-  origin_id: 101                 # ArUco ID for takeoff pad (15x15 cm)
-  landing_target_id: 102         # ArUco ID for landing disc (15x15 cm)
+  origin_id: 101
+  landing_target_id: 102
   marker_size_m: 0.15
   dictionary: aruco_original
 
 mission:
-  num_landings: 3                # Land 3 times total
-  search_radius_m: 3.0           # Competition area radius
-  landing_success_radius_m: 0.5  # Landing disc radius
+  startup_mode: LOITER
+  update_rate_hz: 50
+  journal_capacity: 512
+  event_capacity: 1024
+  ledger_capacity: 4096
+  # Legacy rollback profile only; new coordinator always executes one sortie.
+  num_landings: 3
+  search_radius_m: 3.0
+  landing_success_radius_m: 0.5
+  search_route_body_frd_m:
+    - {forward: 1.0, right: 0.0, down: 0.0}
+    - {forward: 0.0, right: 1.0, down: 0.0}
+    - {forward: -1.0, right: 0.0, down: 0.0}
+    - {forward: 0.0, right: -1.0, down: 0.0}
+
+freshness_s:
+  heartbeat: 0.5
+  local_position: 0.5
+  attitude: 0.5
+  ekf: 1.0
+  landed_state: 1.0
+  camera: 0.5
+  target_down_distance: 0.25
+
+motion:
+  departure_threshold_m: 0.15
+  position_tolerance_m: 0.20
+  settle_dwell_s: 1.0
+
+timeouts:
+  connection_s: 30.0
+  ekf_s: 60.0
+  mode_change_s: 3.0
+  arm_s: 5.0
+  takeoff_s: 15.0
+  waypoint_s: 15.0
+  landing_s: 45.0
+  # Legacy rollback controller keys; ignored by new coordinator.
+  search_sweep_s: 60.0
+  alignment_s: 10.0
+
+startup:
+  # Legacy rollback controller key; new Preflight uses telemetry evidence.
+  pixhawk_init_delay_s: 6.0
+
+comm:
+  heartbeat_rate_hz: 2.0
+  telemetry_publish_rate_hz: 10.0
+  command_max_age_s: 0.5
+  result_correlation_s: 3.0
+  command_capacity: 128
+  result_capacity: 256
+
+shutdown:
+  grounded_evidence_max_age_s: 1.0
+
+# Disabled until a separately validated, timestamped BODY_FRD down-distance
+# source exists. geometry_msgs/Point.z remains marker ID and is never depth.
+landing_target_relay:
+  enabled: false
+  down_distance_source: gated
 
 grid:
-  origin_x_m: -2.5               # Grid origin (bottom-left corner)
+  origin_x_m: -2.5
   origin_y_m: -0.5
-  cell_size_m: 1.0               # 1x1 m sectors
+  cell_size_m: 1.0
   columns: [A, B, C, D, E, F]
   rows: [1, 2, 3, 4, 5, 6]
 
@@ -36,20 +91,14 @@ ros2:
   vision_topic: /erc/vision_targets
   domain_id: 42
 
-timeouts:
-  takeoff_s: 15.0
-  search_sweep_s: 60.0
-  alignment_s: 10.0
-  landing_s: 15.0
-
 led:
   enabled: true
-  gpio_pin: 10         # GPIO 10 (Physical Pin 19 - Hardware SPI MOSI for Raspberry Pi 5)
-  spi_bus: 0           # /dev/spidev0.0
+  gpio_pin: 10
+  spi_bus: 0
   spi_device: 0
-  num_leds: 7          # 7-bit WS2812 5050 RGB LED ring/module
-  brightness: 128      # 0-255 brightness scale (~50% brightness)
+  num_leds: 7
+  brightness: 128
   dma_channel: 10
   colors:
-    manual: [0, 255, 0]      # Green for manual control / standby
-    autonomous: [255, 0, 0]  # Red for autonomy execution
+    manual: [0, 255, 0]
+    autonomous: [255, 0, 0]

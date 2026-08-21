@@ -1,51 +1,58 @@
 # Indomitus Drone — ERC 2026
 
-Autonomous quadcopter system for the **European Rover Challenge 2026 — Droning Sub-Task**.
+Autonomous quadcopter mission runtime for Raspberry Pi 5, ROS 2 Jazzy, pymavlink, Pixhawk 6C, and ArduCopter.
 
-## Architecture
+## Runtime architecture
 
-| Layer | Technology | Role |
-|-------|-----------|------|
-| **Eyes** | Simulink → compiled C++ ROS 2 node | ArUco detection, probe detection, coordinate estimation |
-| **Brain** | Python + `rclpy` | State machine (Search → Align → Land), flight decisions |
-| **Muscle** | `pymavlink` → Pixhawk 6C (ArduCopter) | Flight dynamics, EKF3 sensor fusion, motor control |
-
+```text
+Simulink ROS vision -> RuntimeSupervisor -> MissionCoordinator/state objects
+Pixhawk telemetry  -> ObservationStore  -> CommandGateway -> comm child -> Pixhawk
 ```
-[Arducam IMX708] → [Simulink C++ ROS 2 Node] → /erc/vision_targets → [Python State Machine] → [pymavlink] → [Pixhawk 6C]
+
+Lifecycle:
+
+```text
+Preflight -> Takeoff -> fixed-route Search -> PrecisionLanding -> Completed
 ```
+
+Controlled failures use one `LandHere`; landing failures become passive `AirborneFault`. Ctrl+C or unexpected fresh mode yields control without issuing LAND. Typed semantic operations receive one IPC submission attempt and at most one low-level MAVLink send attempt.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for current implementation, safety invariants, and rollout gates.
+
+## Important current gate
+
+`LANDING_TARGET` relay is disabled until a validated BODY_FRD down-distance source exists. `/erc/vision_targets` uses `geometry_msgs/msg/Point.z` as marker ID, not depth. Current source must pass SITL and props-removed validation before flight rollout.
+
+## Raspberry Pi launch
+
+`main.py` can command real motors through `/dev/ttyAMA0`. Launch only on configured hardware:
+
+```bash
+./scripts/start_mission.sh
+```
+
+Launcher sources ROS 2 workspaces, sets `ROS_DOMAIN_ID=42`, activates system-site-packages virtual environment, and preserves environment through `sudo -E`.
+
+## Safe focused verification
+
+```bash
+python3 -m pytest tests/activities tests/comm tests/commands tests/integration tests/mission tests/navigation tests/observations tests/runtime -q
+python3 -m unittest tests.test_square_controller -v
+python3 -m unittest tests.test_led_indicator -v
+python3 -m pytest tests/test_grid_mapper.py -q
+```
+
+Never run `main.py`, `test_square_flight.py`, or root landing-target scripts as routine tests.
 
 ## Hardware
 
-- Frame: F450 with DJI 2212 920KV motors
-- FC: Pixhawk 6C (ArduCopter)
-- Computer: Raspberry Pi 5 (16 GB)
-- Camera: Arducam IMX708 (downward)
-- Odometry: Microair MTF-01 optical flow
-- GPS: Holybro M10
-
-## Quick Start (on the Raspberry Pi)
-
-```bash
-# 1. Source ROS 2 environment
-source /opt/ros/jazzy/setup.bash
-source ~/ros2_ws/install/setup.bash
-
-source ~/.bashrc           # loads ROS 2 Jazzy environment
-source .venv/bin/activate  # activates the Python venv
-
-# 2. Run the mission
-cd ~/indomitus-drone
-sudo -E python3 main.py
-```
-
-## Setup
-
-See [docs/SETUP.md](docs/SETUP.md) for full Raspberry Pi configuration guide.
+- F450 airframe, DJI 2212 motors
+- Pixhawk 6C running ArduCopter
+- Raspberry Pi 5
+- Downward Arducam IMX708
+- Microair MTF-01 optical flow/range sensor
+- Holybro M10 GPS/compass
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
-
-## Team
-
-UCU Space Robotics — Indomitus
+MIT — see [LICENSE](LICENSE).

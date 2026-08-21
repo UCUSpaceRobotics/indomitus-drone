@@ -43,6 +43,9 @@ class PixhawkClient:
             "pos_x_m": 0.0,  # Local North
             "pos_y_m": 0.0,  # Local East
             "pos_z_m": 0.0,  # Local Down (Negative is UP)
+            "vel_x_m_s": 0.0,
+            "vel_y_m_s": 0.0,
+            "vel_z_m_s": 0.0,
             "roll_rad": 0.0,
             "pitch_rad": 0.0,
             "yaw_rad": 0.0,
@@ -51,7 +54,10 @@ class PixhawkClient:
             "last_heartbeat_time": 0.0,
             "last_ekf_time": 0.0,
             "last_rc_channels_time": 0.0,
+            "landed_state": "undefined",
+            "last_landed_state_time": 0.0,
         }
+        self._protocol_events = []
 
     def wait_for_heartbeat(self, timeout=10.0):
         """
@@ -59,14 +65,42 @@ class PixhawkClient:
         This establishes the target_system and target_component IDs.
         """
         print("[COMM] Waiting for Pixhawk heartbeat...")
-        msg = self.connection.wait_heartbeat(timeout=timeout)
+        deadline = time.monotonic() + timeout
+        msg = None
+        while time.monotonic() < deadline:
+            candidate = self.connection.recv_match(
+                type="HEARTBEAT",
+                blocking=True,
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+            if candidate is None:
+                break
+            if getattr(candidate, "type", None) == mavutil.mavlink.MAV_TYPE_GCS:
+                continue
+            if (
+                getattr(candidate, "autopilot", None)
+                == mavutil.mavlink.MAV_AUTOPILOT_INVALID
+            ):
+                continue
+            msg = candidate
+            get_system = getattr(msg, "get_srcSystem", None)
+            get_component = getattr(msg, "get_srcComponent", None)
+            if get_system is not None:
+                self.connection.target_system = get_system()
+            if get_component is not None:
+                self.connection.target_component = get_component()
+            break
 
-        if msg:
+        if msg is not None:
             print(
                 f"[COMM] Heartbeat received! Target System: {self.connection.target_system}, Component: {self.connection.target_component}"
             )
             self.telemetry["connected"] = True
-            self.telemetry["last_heartbeat_time"] = time.time()
+            self.telemetry["last_heartbeat_time"] = time.monotonic()
+            self.telemetry["armed"] = bool(
+                msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+            )
+            self.telemetry["mode"] = mavutil.mode_string_v10(msg)
             return True
         else:
             print("[COMM] ERROR: Timeout waiting for heartbeat.")
@@ -81,6 +115,7 @@ class PixhawkClient:
             "MAVLINK_MSG_ID_SYS_STATUS",
             "MAVLINK_MSG_ID_EKF_STATUS_REPORT",
             "MAVLINK_MSG_ID_RC_CHANNELS",
+            "MAVLINK_MSG_ID_EXTENDED_SYS_STATE",
         ):
             self._request_message_interval_by_name(msg_name, rate_hz)
 
@@ -124,21 +159,26 @@ class PixhawkClient:
             mavutil.mavlink.MAV_TYPE_GCS, mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0
         )
 
-    def get_telemetry_tick(self):
+    def get_telemetry_tick(self, max_messages=100):
         """
         Non-blocking read of the MAVLink buffer. Parses ALL incoming messages,
         updates telemetry, and prints Pixhawk text messages (STATUSTEXT).
         Returns the updated dictionary.
         """
-        while True:
+        processed = 0
+        while processed < max_messages:
             msg = self.connection.recv_match(blocking=False)
             if msg is None:
                 break  # Buffer is empty, exit loop
+            processed += 1
 
             msg_type = msg.get_type()
+            if not self._message_from_target(msg, msg_type):
+                continue
 
             if msg_type == "HEARTBEAT":
-                self.telemetry["last_heartbeat_time"] = time.time()
+                self.telemetry["last_heartbeat_time"] = time.monotonic()
+                self.telemetry["connected"] = True
                 self.telemetry["armed"] = bool(
                     msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
                 )
@@ -148,13 +188,16 @@ class PixhawkClient:
                 self.telemetry["pos_x_m"] = msg.x
                 self.telemetry["pos_y_m"] = msg.y
                 self.telemetry["pos_z_m"] = msg.z
-                self.telemetry["last_local_position_time"] = time.time()
+                self.telemetry["vel_x_m_s"] = getattr(msg, "vx", 0.0)
+                self.telemetry["vel_y_m_s"] = getattr(msg, "vy", 0.0)
+                self.telemetry["vel_z_m_s"] = getattr(msg, "vz", 0.0)
+                self.telemetry["last_local_position_time"] = time.monotonic()
 
             elif msg_type == "ATTITUDE":
                 self.telemetry["roll_rad"] = msg.roll
                 self.telemetry["pitch_rad"] = msg.pitch
                 self.telemetry["yaw_rad"] = msg.yaw
-                self.telemetry["last_attitude_time"] = time.time()
+                self.telemetry["last_attitude_time"] = time.monotonic()
 
             elif msg_type == "SYS_STATUS":
                 self.telemetry["battery_voltage_v"] = msg.voltage_battery / 1000.0
@@ -163,7 +206,7 @@ class PixhawkClient:
             elif msg_type == "EKF_STATUS_REPORT":
                 self.telemetry["ekf_flags"] = msg.flags
                 self.telemetry["ekf_healthy"] = self._ekf_flags_healthy(msg.flags)
-                self.telemetry["last_ekf_time"] = time.time()
+                self.telemetry["last_ekf_time"] = time.monotonic()
 
             elif msg_type in ("RC_CHANNELS", "RC_CHANNELS_RAW"):
                 self.telemetry["rc_rssi"] = msg.rssi
@@ -171,7 +214,33 @@ class PixhawkClient:
                 self.telemetry["rc_link_live"] = (
                     msg.rssi != 255 or self.telemetry["rc_channel_count"] > 0
                 )
-                self.telemetry["last_rc_channels_time"] = time.time()
+                self.telemetry["last_rc_channels_time"] = time.monotonic()
+
+            elif msg_type == "EXTENDED_SYS_STATE":
+                landed = getattr(msg, "landed_state", 0)
+                landed_names = {
+                    getattr(mavutil.mavlink, "MAV_LANDED_STATE_UNDEFINED", 0): "undefined",
+                    getattr(mavutil.mavlink, "MAV_LANDED_STATE_ON_GROUND", 1): "on-ground",
+                    getattr(mavutil.mavlink, "MAV_LANDED_STATE_IN_AIR", 2): "in-air",
+                    getattr(mavutil.mavlink, "MAV_LANDED_STATE_TAKEOFF", 3): "takeoff",
+                    getattr(mavutil.mavlink, "MAV_LANDED_STATE_LANDING", 4): "landing",
+                }
+                self.telemetry["landed_state"] = landed_names.get(
+                    landed, "undefined"
+                )
+                self.telemetry["last_landed_state_time"] = time.monotonic()
+
+            elif msg_type == "COMMAND_ACK":
+                self._protocol_events.append(
+                    {
+                        "type": "command_ack",
+                        "command": msg.command,
+                        "result": msg.result,
+                        "accepted": msg.result
+                        == mavutil.mavlink.MAV_RESULT_ACCEPTED,
+                        "received_at": time.monotonic(),
+                    }
+                )
 
             elif msg_type == "STATUSTEXT":
                 # Intercept text messages from Pixhawk (Pre-Arm errors, EKF warnings, etc.)
@@ -183,6 +252,28 @@ class PixhawkClient:
                 print(f"\n⚠️ [PIXHAWK MSG]: {text}")
 
         return self.telemetry
+
+    def _message_from_target(self, msg, msg_type):
+        """Reject telemetry/results from other systems or flight components."""
+        get_system = getattr(msg, "get_srcSystem", None)
+        source_system = get_system() if get_system is not None else None
+        target_system = getattr(self.connection, "target_system", None)
+        if source_system not in (None, 0) and target_system not in (None, 0):
+            if source_system != target_system:
+                return False
+        if msg_type in {"HEARTBEAT", "COMMAND_ACK", "EXTENDED_SYS_STATE"}:
+            get_component = getattr(msg, "get_srcComponent", None)
+            source_component = get_component() if get_component is not None else None
+            target_component = getattr(self.connection, "target_component", None)
+            if source_component not in (None, 0) and target_component not in (None, 0):
+                return source_component == target_component
+        return True
+
+    def drain_protocol_events(self):
+        """Return ACK-related events parsed by the centralized receive loop."""
+        events = tuple(self._protocol_events)
+        self._protocol_events.clear()
+        return events
 
     def _ekf_flags_healthy(self, flags):
         """Checks EKF status bits needed for guided local-position tests."""
@@ -218,7 +309,7 @@ class PixhawkClient:
 
     def get_pose(self, max_age_s=0.5, now_s=None):
         """Returns the latest local-NED pose and whether both pose streams are fresh."""
-        now_s = now_s if now_s is not None else time.time()
+        now_s = now_s if now_s is not None else time.monotonic()
         local_age_s = now_s - self.telemetry.get("last_local_position_time", 0.0)
         attitude_age_s = now_s - self.telemetry.get("last_attitude_time", 0.0)
         fresh = local_age_s <= max_age_s and attitude_age_s <= max_age_s
@@ -254,19 +345,12 @@ class PixhawkClient:
         print(f"[COMM] Command sent: Change mode to {mode_name}")
         return True
 
-    def arm(self, state=True, timeout=3.0):
-        """
-        Arms or disarms the motors and waits for confirmation from the Pixhawk.
-        Uses a separate fast read loop to catch COMMAND_ACK while maintaining STATUSTEXT logging.
-
-        Returns:
-        bool: True if the command was accepted, False if rejected or timed out.
-        """
+    def arm(self, state=True):
+        """Send one nonblocking arm/disarm command."""
         arm_val = 1 if state else 0
         action = "ARM" if state else "DISARM"
         print(f"[COMM] Sending {action} command...")
 
-        # 1. Send the command
         self.connection.mav.command_long_send(
             self.connection.target_system,
             self.connection.target_component,
@@ -281,42 +365,7 @@ class PixhawkClient:
             0,  # Params 2-7 (unused)
         )
 
-        # 2. Direct monitoring loop for ACK
-        start_time = time.time()
-        while (time.time() - start_time) < timeout:
-            msg = self.connection.recv_match(blocking=False)
-
-            if msg is None:
-                time.sleep(0.01)
-                continue
-
-            msg_type = msg.get_type()
-
-            # Ensure we still print status texts if they arrive inside this loop
-            if msg_type == "STATUSTEXT":
-                text = (
-                    msg.text.decode("utf-8")
-                    if isinstance(msg.text, bytes)
-                    else msg.text
-                )
-                print(f"\n⚠️ [PIXHAWK MSG inside ARM]: {text}")
-
-            elif msg_type == "COMMAND_ACK":
-                if msg.command == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
-                    if msg.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
-                        print(f"[COMM] SUCCESS: Drone is now {action}ED.")
-                        self.telemetry["armed"] = state
-                        return True
-                    else:
-                        print(
-                            f"[COMM] ERROR: {action} command rejected! (MAV_RESULT code: {msg.result})"
-                        )
-                        return False
-
-        print(
-            f"[COMM] TIMEOUT: No acknowledgment received for {action} command after {timeout}s."
-        )
-        return False
+        return True
 
     def liftoff(self, altitude_m):
         """
@@ -342,14 +391,7 @@ class PixhawkClient:
         """Compatibility wrapper for liftoff()."""
         self.liftoff(altitude_m)
 
-    def land(self):
-        """Commands the drone to land using MAV_CMD_NAV_LAND."""
-        precision_mode = getattr(
-            mavutil.mavlink,
-            "PRECISION_LAND_MODE_OPPORTUNISTIC",
-            1,
-        )
-
+    def _send_land(self, precision_mode):
         self.connection.mav.command_long_send(
             self.connection.target_system,
             self.connection.target_component,
@@ -363,7 +405,26 @@ class PixhawkClient:
             0.0,  # param6: land at current longitude
             0.0,  # param7: ground level
         )
+
+    def precision_land(self):
+        """Send one opportunistic precision LAND command (param2=1)."""
+        precision_mode = getattr(
+            mavutil.mavlink, "PRECISION_LAND_MODE_OPPORTUNISTIC", 1
+        )
+        self._send_land(precision_mode)
         print("[COMM] Command sent: OPPORTUNISTIC PRECISION LAND")
+
+    def land_here(self):
+        """Send one non-precision LAND command (param2=0)."""
+        precision_mode = getattr(
+            mavutil.mavlink, "PRECISION_LAND_MODE_DISABLED", 0
+        )
+        self._send_land(precision_mode)
+        print("[COMM] Command sent: LAND HERE")
+
+    def land(self):
+        """Compatibility alias for opportunistic precision landing."""
+        self.precision_land()
 
     def send_position_target_local_ned(self, dx_m, dy_m, dz_m):
         """
@@ -555,7 +616,7 @@ class PixhawkClient:
         distance_m = math.sqrt(x_m**2 + y_m**2 + z_m**2)
 
         self.connection.mav.landing_target_send(
-            int(time.time() * 1_000_000),  # time_usec
+            int(time.monotonic() * 1_000_000),  # time_usec
             0,  # target_num
             mavutil.mavlink.MAV_FRAME_BODY_FRD,
             0.0,  # angle_x, unused in position mode

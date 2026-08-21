@@ -1,0 +1,1 @@
+"""Typed mission command boundary."""

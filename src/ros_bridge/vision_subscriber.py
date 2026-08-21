@@ -28,12 +28,14 @@ Usage:
 from __future__ import annotations
 
 import time
+from collections import deque
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Point
 
 from src.utils.grid_mapper import GridMapper
+from src.observations.model import CameraObservation
 
 
 # Marker IDs used in the ERC 2026 competition.
@@ -94,6 +96,7 @@ class VisionBridge:
 
         # Message counter for diagnostics.
         self._msg_count: int = 0
+        self._events: deque[CameraObservation] = deque()
 
         # Create the internal ROS 2 node.
         self._node = _VisionSubscriberNode(topic, self._on_vision_msg)
@@ -126,7 +129,7 @@ class VisionBridge:
         if self._last_detection_time == 0.0:
             return None
 
-        age = time.time() - self._last_detection_time
+        age = time.monotonic() - self._last_detection_time
 
         if age > self._detection_timeout_s:
             return None
@@ -159,6 +162,12 @@ class VisionBridge:
         """Return the total number of messages received (for diagnostics)."""
         return self._msg_count
 
+    def drain_events(self) -> tuple[CameraObservation, ...]:
+        """Consume uniquely identified camera observations in receive order."""
+        events = tuple(self._events)
+        self._events.clear()
+        return events
+
     def shutdown(self) -> None:
         """Destroy the internal ROS 2 node. Call before rclpy.shutdown()."""
         self._node.destroy_node()
@@ -177,6 +186,18 @@ class VisionBridge:
         """
         self._msg_count += 1
         marker_id = msg.z
+        received_at = time.monotonic()
+        corrected_x = -msg.x if marker_id in (MARKER_ID_ORIGIN, MARKER_ID_LANDING) else msg.x
+        self._events.append(
+            CameraObservation(
+                observation_id=f"vision/{self._msg_count}",
+                marker_id=int(marker_id),
+                x_offset_m=float(corrected_x),
+                y_offset_m=float(msg.y),
+                observed_at=received_at,
+                received_at=received_at,
+            )
+        )
 
         if marker_id in (MARKER_ID_ORIGIN, MARKER_ID_LANDING):
             # ArUco marker detection.
@@ -185,7 +206,7 @@ class VisionBridge:
             # to the drone's right direction.
             self._latest_x = -msg.x
             self._latest_y = msg.y
-            self._last_detection_time = time.time()
+            self._last_detection_time = received_at
 
         elif marker_id < 0:
             # Probe detection. x, y are world position relative to takeoff pad.
