@@ -42,7 +42,7 @@ def main():
         time.sleep(2)
 
         # 4. Зліт (Тестовий)
-        TARGET_ALTITUDE = 1.0
+        TARGET_ALTITUDE = 2.0
         print(f"\n>>> КРОК 3: Команда TAKEOFF (Зліт на {TARGET_ALTITUDE} метри)...")
         command_queue.put(create_command("takeoff", altitude=TARGET_ALTITUDE))
 
@@ -53,6 +53,8 @@ def main():
         reach_start_time = time.time()
         while (time.time() - reach_start_time) < ALTITUDE_REACH_TIMEOUT:
             try:
+                command_queue.put(create_command("send_landing_target", target=(2.0, 0.0, TARGET_ALTITUDE), initiate_landing=False))
+                
                 telem = telemetry_queue.get(timeout=0.1)
                 alt_m = -telem.get('pos_z_m', 0.0)
                 mode = telem.get('mode', 'UNKNOWN')
@@ -103,38 +105,37 @@ def main():
 
             time.sleep(0.2) # Оновлення 5 разів на секунду
 
-        # 6.5 Рух 1м вперед (по осі X у локальній системі координат)
-        print("\n>>> КРОК 6: Рух на 1 метр вперед (по осі X у локальній системі координат)...")
-        command_queue.put(create_command("send_landing_target", target=(1.0, -1.0, 0.0), initiate_landing=False))
-        command_queue.put(create_command("move_local_pos", dx=1.0, dy=0.0, dz=0.0))
-        time.sleep(3) # Час на виконання руху
+        # # 6.5 Рух 1м вперед (по осі X у локальній системі координат)
+        # print("\n>>> КРОК 6: Рух на 1 метр вперед (по осі X у локальній системі координат)...")
+        # command_queue.put(create_command("move_local_pos", dx=1.0, dy=0.0, dz=0.0))
+        # time.sleep(3) # Час на виконання руху
 
-        # 7. Моніторинг польоту / висіння у повітрі
-        FLIGHT_DURATION = 3.0  # Час висіння у секундах
-        print(f"\n>>> КРОК 7: Моніторинг телеметрії у польоті ({FLIGHT_DURATION} секунд)...")
-        start_time = time.time()
+        # # 7. Моніторинг польоту / висіння у повітрі
+        # FLIGHT_DURATION = 3.0  # Час висіння у секундах
+        # print(f"\n>>> КРОК 7: Моніторинг телеметрії у польоті ({FLIGHT_DURATION} секунд)...")
+        # start_time = time.time()
 
-        while (time.time() - start_time) < FLIGHT_DURATION:
-            try:
-                # Дістаємо найсвіжіший словник телеметрії
-                telem = telemetry_queue.get(timeout=0.1)
+        # while (time.time() - start_time) < FLIGHT_DURATION:
+        #     try:
+        #         # Дістаємо найсвіжіший словник телеметрії
+        #         telem = telemetry_queue.get(timeout=0.1)
 
-                # Z-координата в NED йде вниз від точки старту, інвертуємо для реальної висоти
-                alt_m = -telem.get('pos_z_m', 0.0)
-                mode = telem.get('mode', 'UNKNOWN')
-                armed = "ТАК" if telem.get('armed') else "НІ"
-                batt = telem.get('battery_voltage_v', 0.0)
+        #         # Z-координата в NED йде вниз від точки старту, інвертуємо для реальної висоти
+        #         alt_m = -telem.get('pos_z_m', 0.0)
+        #         mode = telem.get('mode', 'UNKNOWN')
+        #         armed = "ТАК" if telem.get('armed') else "НІ"
+        #         batt = telem.get('battery_voltage_v', 0.0)
 
-                # Друк телеметрії в один рядок
-                sys.stdout.write(f"\r[ТЕЛЕМЕТРІЯ] Режим: {mode:^8} | Арм: {armed:^3} | Висота: {alt_m:>5.2f}м | Батарея: {batt:>5.1f}V ")
-                sys.stdout.flush()
+        #         # Друк телеметрії в один рядок
+        #         sys.stdout.write(f"\r[ТЕЛЕМЕТРІЯ] Режим: {mode:^8} | Арм: {armed:^3} | Висота: {alt_m:>5.2f}м | Батарея: {batt:>5.1f}V ")
+        #         sys.stdout.flush()
 
-            except queue.Empty:
-                pass
+        #     except queue.Empty:
+        #         pass
 
-            time.sleep(0.2) # Оновлення 5 разів на секунду
+        #     time.sleep(0.2) # Оновлення 5 разів на секунду
 
-        print() # Перенесення рядка після завершення циклу
+        # print() # Перенесення рядка після завершення циклу
 
         # # 8. Рух 1м вправо (по осі X у локальній системі координат)
         # print("\n>>> КРОК 8: Рух на 1 метр вправо (по осі X у локальній системі координат)...")
