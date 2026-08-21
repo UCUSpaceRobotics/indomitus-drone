@@ -294,10 +294,12 @@ class MissionController:
             self._send("move_local_pos", dx=1.0, dy=0.0, dz=0.0)  # Maintain hover.
             print("[STATE] Hovering forward 1m, waiting for marker detection...")
             self._initiate_movement_time = time.time()
+            self._search_phase = 2  # Move to phase 2 to wait for hover completion.
         elif self._search_phase == 2:
             # Phase 2: Maintain hover and check for marker detection.
-            if time.time() - self._initiate_movement_time >= 5.0:
+            if time.time() - self._initiate_movement_time >= 10.0:
                 print("[STATE] Hovering forward 1m complete, continuing search...")
+                self._search_attempts += 1
                 self._search_phase = 1  # Loop back to maintain hover.
 
 
