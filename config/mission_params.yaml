@@ -4,8 +4,8 @@ startup:
   pixhawk_init_delay_s: 6.0    # Wait for Pixhawk heartbeat + EKF convergence after boot
 
 flight:
-  takeoff_altitude_m: 2.5        # Search altitude
-  search_altitude_m: 2.5         # Height for marker search sweep
+  takeoff_altitude_m: 1.5        # Search altitude
+  search_altitude_m: 1.5         # Height for marker search sweep
   landing_approach_altitude_m: 1.0
   max_horizontal_speed_m_s: 0.5
   max_vertical_speed_m_s: 0.3
