@@ -76,8 +76,8 @@ def main() -> int:
             else:
                 status += (
                     f" marker={target['marker_id']}"
-                    f" right={target['x_offset_m']:+.3f}m"
-                    f" forward={target['y_offset_m']:+.3f}m"
+                    f" forward={target['x_offset_m']:+.3f}m"
+                    f" right={target['y_offset_m']:+.3f}m"
                     f" age={target['age_s']:.3f}s"
                 )
 
