@@ -62,7 +62,7 @@ class MissionController:
     """
 
     # Maximum horizontal distance from takeoff origin before emergency LAND (meters).
-    MAX_DISTANCE_FROM_ORIGIN_M = 3.0
+    MAX_DISTANCE_FROM_ORIGIN_M = 4.2
 
     # Consecutive valid vision detection frames required before transitioning from SEARCH to DESCEND (~100ms at 50Hz).
     SEARCH_CONFIRM_TICKS = 5
