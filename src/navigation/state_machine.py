@@ -100,6 +100,10 @@ class MissionController:
         # DESCEND state tracking.
         self._land_cmd_sent = False
 
+        self._search_phase = 0  # 0=hover, 1=hover forward, 2=searching
+        self._initiate_movement_time = 0.0  # Time when movement command was sent
+        self._search_attempts = 0  # Count of search attempts (hover forward cycles)
+
         print("[STATE] MissionController initialized - single mission run.")
         print(f"[STATE] Starting in {self.state.value}")
         self._update_led_indicator()
@@ -273,6 +277,29 @@ class MissionController:
             self._send("set_mode", mode="LAND")
             self._transition_to(FlightState.COMPLETE)
             return
+
+        if self._search_phase == 0:
+            # Phase 0: Hover in place (no movement commands).
+            if time.time() - self._takeoff_cmd_time >= 5.0:
+                print("[STATE] Hover in place for 5 seconds.")
+                self._search_phase = 1
+        elif self._search_phase == 1:
+            if self._search_attempts >= 3:
+                print("[STATE] Maximum search attempts reached. Commanding LAND.")
+                self._send("set_mode", mode="LAND")
+                self._transition_to(FlightState.COMPLETE)
+                return
+
+            print("[STATE] Searching for landing target marker...")
+            self._send("move_local_pos", dx=1.0, dy=0.0, dz=0.0)  # Maintain hover.
+            print("[STATE] Hovering forward 1m, waiting for marker detection...")
+            self._initiate_movement_time = time.time()
+        elif self._search_phase == 2:
+            # Phase 2: Maintain hover and check for marker detection.
+            if time.time() - self._initiate_movement_time >= 5.0:
+                print("[STATE] Hovering forward 1m complete, continuing search...")
+                self._search_phase = 1  # Loop back to maintain hover.
+
 
         # Check vision for landing target.
         target = self.vision.get_latest_target()
