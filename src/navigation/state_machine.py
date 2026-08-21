@@ -1,15 +1,23 @@
 """Autonomous flight state machine for ERC 2026 Droning Sub-Task.
 
-Implements the mission cycle: IDLE -> TAKEOFF -> SEARCH -> ALIGN -> LAND -> COMPLETE.
-Repeated 3 times, then MISSION_DONE.
+Implements a single mission cycle:
+    IDLE → TAKEOFF → SEARCH → DESCEND → COMPLETE
 
-The state machine is driven by a single update() method called ~50 times/second
-by main.py. Each call reads telemetry and vision, does the work for the current
-state, and checks if the exit condition is met.
+The drone is manually placed on the takeoff platform before each run.
+The program executes one mission and exits. Restart it for each attempt.
+
+Alignment with the landing target is handled by ArduPilot's built-in
+precision landing controller. The companion computer continuously sends
+LANDING_TARGET messages with the target's BODY_FRD position; ArduPilot
+uses its internal PID loops to steer toward the target during descent.
+
+Prerequisites (set via Mission Planner):
+    PLND_ENABLED = 1
+    PLND_TYPE    = 1  (MAVLink)
 
 Usage:
     mission = MissionController(command_queue, telemetry_queue, vision_bridge, config)
-    while mission.state != FlightState.MISSION_DONE:
+    while mission.state != FlightState.COMPLETE:
         mission.update()
         time.sleep(0.02)
 """
@@ -29,41 +37,32 @@ class FlightState(Enum):
     IDLE = "IDLE"
     TAKEOFF = "TAKEOFF"
     SEARCH = "SEARCH"
-    ALIGN = "ALIGN"
-    LAND = "LAND"
+    DESCEND = "DESCEND"
     COMPLETE = "COMPLETE"
-    MISSION_DONE = "MISSION_DONE"
 
 
 class MissionController:
-    """Finite state machine controlling the autonomous drone mission.
+    """Finite state machine controlling a single autonomous drone mission.
 
     Architecture:
         - Reads drone telemetry from telemetry_queue (filled by mavlink_node.py).
         - Reads vision data from VisionBridge (filled by Simulink via ROS 2).
         - Sends flight commands to command_queue (consumed by mavlink_node.py).
 
+    Safety features:
+        - Geofence: emergency LAND if the drone drifts >3 m from takeoff origin.
+        - Timeouts: every state has a timeout that triggers LAND on expiry.
+
     Args:
         command_queue: multiprocessing.Queue for sending commands to the comm process.
         telemetry_queue: multiprocessing.Queue for receiving telemetry from the comm process.
         vision_bridge: VisionBridge instance for reading vision detections.
         config: Parsed mission_params.yaml dictionary.
+        led_indicator: Optional LEDController instance.
     """
 
-    # ALIGN controller gain. Start conservative — increase if convergence is too slow,
-    # decrease if the drone oscillates. The Pixhawk's internal GUIDED-mode PID
-    # adds additional damping, so P-only may be sufficient.
-    ALIGN_KP = 0.5  # m/s per meter of offset
-
-    # How close to center (in meters) the marker must be to count as "aligned".
-    ALIGN_CENTERED_THRESHOLD_M = 0.05
-
-    # How many consecutive update() ticks the drone must remain centered
-    # before transitioning to LAND. At 50 Hz, 50 ticks = 1 second.
-    ALIGN_CENTERED_TICKS_REQUIRED = 50
-
-    # How long the marker can be missing before we consider it lost (seconds).
-    ALIGN_LOST_TIMEOUT_S = 0.5
+    # Maximum horizontal distance from takeoff origin before emergency LAND (meters).
+    MAX_DISTANCE_FROM_ORIGIN_M = 3.0
 
     def __init__(self, command_queue, telemetry_queue, vision_bridge, config: dict, led_indicator=None):
         self.cmd_q = command_queue
@@ -76,15 +75,10 @@ class MissionController:
         self.state = FlightState.IDLE
         self.state_entry_time = time.time()
 
-        # Mission progress.
-        self.attempt = 0  # Incremented AFTER each landing (1, 2, 3).
-        self.num_landings = config["mission"]["num_landings"]
-
         # Timeouts (seconds).
         self.timeout_takeoff = config["timeouts"]["takeoff_s"]
         self.timeout_search = config["timeouts"]["search_sweep_s"]
-        self.timeout_align = config["timeouts"]["alignment_s"]
-        self.timeout_land = config["timeouts"]["landing_s"]
+        self.timeout_descend = config["timeouts"]["landing_s"]
 
         # Flight parameters.
         self.takeoff_alt = config["flight"]["takeoff_altitude_m"]
@@ -94,16 +88,13 @@ class MissionController:
         self.telem: dict = {}
 
         # TAKEOFF sub-phase tracking.
-        self._takeoff_phase = 0  # 0=arm, 1=guided, 2=takeoff_cmd, 3=climbing
+        self._takeoff_phase = 0  # 0=loiter, 1=arm, 2=guided, 3=takeoff_cmd, 4=climbing
         self._takeoff_cmd_time = 0.0
 
-        # ALIGN state tracking.
-        self._centered_ticks = 0
+        # DESCEND state tracking.
+        self._land_cmd_sent = False
 
-        # LAND state tracking.
-        self._land_initiated = False
-
-        print(f"[STATE] MissionController initialized. Target: {self.num_landings} landings.")
+        print("[STATE] MissionController initialized — single mission run.")
         print(f"[STATE] Starting in {self.state.value}")
         self._update_led_indicator()
 
@@ -118,11 +109,16 @@ class MissionController:
         the main loop calls. Internally it:
             1. Refreshes telemetry from the comm process queue.
             2. Processes pending ROS 2 vision messages.
-            3. Dispatches to the handler for the current state.
-            4. Updates the LED indicator state.
+            3. Checks geofence safety.
+            4. Dispatches to the handler for the current state.
+            5. Updates the LED indicator state.
         """
         self._refresh_telemetry()
         self.vision.spin_once()
+
+        # Safety: emergency land if drone drifts too far from origin.
+        if self._check_geofence():
+            return  # State was forced to COMPLETE, skip normal handler.
 
         if self.state == FlightState.IDLE:
             self._update_idle()
@@ -130,34 +126,40 @@ class MissionController:
             self._update_takeoff()
         elif self.state == FlightState.SEARCH:
             self._update_search()
-        elif self.state == FlightState.ALIGN:
-            self._update_align()
-        elif self.state == FlightState.LAND:
-            self._update_land()
-        elif self.state == FlightState.COMPLETE:
-            self._update_complete()
-        # MISSION_DONE: do nothing, main loop will exit.
+        elif self.state == FlightState.DESCEND:
+            self._update_descend()
+        # COMPLETE: do nothing, main loop will exit.
 
         self._update_led_indicator()
 
-    def _update_led_indicator(self):
-        """Update LED indicator (Green = Manual control, Red = Autonomous execution)."""
-        if self.led is None:
-            return
+    # ==================================================================
+    # Safety
+    # ==================================================================
 
-        is_autonomous_state = self.state in (
-            FlightState.TAKEOFF,
-            FlightState.SEARCH,
-            FlightState.ALIGN,
-            FlightState.LAND,
-        )
+    def _check_geofence(self) -> bool:
+        """Emergency LAND if the drone drifts too far from the takeoff origin.
 
-        mode = self.telem.get("mode", "GUIDED") if self.telem else "GUIDED"
-        is_manual_mode = mode in ("LOITER", "ALT_HOLD", "STABILIZE", "POSHOLD", "RTL", "MANUAL")
+        Returns True if geofence was breached and state was forced to COMPLETE.
+        """
+        if not self.telem:
+            return False
+        if self.state in (FlightState.IDLE, FlightState.COMPLETE):
+            return False
 
-        # Autonomous execution requires autonomous state AND active guided mode
-        is_autonomous = is_autonomous_state and not is_manual_mode
-        self.led.update_state(is_autonomous)
+        x = self.telem.get("pos_x_m", 0.0)
+        y = self.telem.get("pos_y_m", 0.0)
+        distance = math.sqrt(x ** 2 + y ** 2)
+
+        if distance > self.MAX_DISTANCE_FROM_ORIGIN_M:
+            print(
+                f"[STATE] ⚠️ GEOFENCE BREACH — {distance:.2f}m from origin "
+                f"(limit: {self.MAX_DISTANCE_FROM_ORIGIN_M}m). Emergency LAND."
+            )
+            self._send("set_mode", mode="LAND")
+            self._transition_to(FlightState.COMPLETE)
+            return True
+
+        return False
 
     # ==================================================================
     # State handlers
@@ -180,8 +182,7 @@ class MissionController:
             return
 
         # Both conditions met — clear to take off.
-        print(f"[STATE] Pixhawk connected, EKF healthy. Starting attempt {self.attempt + 1}/{self.num_landings}.")
-        self.vision.clear_probes()  # Fresh probe accumulation for this attempt.
+        print("[STATE] Pixhawk connected, EKF healthy. Starting mission.")
         self._transition_to(FlightState.TAKEOFF)
 
     def _update_takeoff(self):
@@ -271,84 +272,34 @@ class MissionController:
                 f"[STATE] Landing target DETECTED at offset "
                 f"({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m"
             )
-            self._transition_to(FlightState.ALIGN)
+            self._transition_to(FlightState.DESCEND)
 
-    def _update_align(self):
-        """ALIGN: Center the drone over the landing target using velocity corrections.
+    def _update_descend(self):
+        """DESCEND: Precision landing using ArduPilot's LANDING_TARGET system.
 
-        Control law (proportional):
-            vx = Kp * y_offset   (camera Y → body forward)
-            vy = Kp * x_offset   (camera X → body right)
+        Instead of manually computing velocity corrections, we continuously
+        feed the target's BODY_FRD position to ArduPilot via LANDING_TARGET
+        messages. ArduPilot's internal precision landing PID controller
+        handles horizontal alignment during the descent.
 
-        Transition to LAND when centered within threshold for 1 full second.
-        Fall back to SEARCH if the marker is lost for > 0.5 seconds.
-        """
-        elapsed = time.time() - self.state_entry_time
+        On first detection:
+            1. Send LANDING_TARGET message with target position.
+            2. Send MAV_CMD_NAV_LAND to initiate the descent.
 
-        # Timeout — land anyway (imprecise landing is better than no landing).
-        if elapsed > self.timeout_align:
-            print("[STATE] ALIGN TIMEOUT — landing at current position.")
-            self._transition_to(FlightState.LAND)
-            return
+        Every subsequent tick:
+            - If the marker is visible: send updated LANDING_TARGET.
+            - If the marker is lost: stop sending. ArduPilot continues
+              descending vertically at the last known position
+              (opportunistic precision landing behavior).
 
-        target = self.vision.get_latest_target()
-
-        # Lost target check.
-        if target is None or target["marker_id"] != self.landing_target_id:
-            if target is None:
-                # Check if we've been without a detection for too long.
-                self._centered_ticks = 0
-                # Vision bridge returns None when detection age > 0.5s,
-                # so if we get None, the marker has been gone long enough.
-                print("[STATE] Marker lost — returning to SEARCH.")
-                self._transition_to(FlightState.SEARCH)
-                return
-            # Detected a different marker (e.g., 101) — ignore it, keep aligning.
-            return
-
-        # Calculate velocity corrections.
-        x_offset = target["x_offset_m"]  # Right of camera center.
-        y_offset = target["y_offset_m"]  # Forward of camera center.
-
-        vx = self.ALIGN_KP * y_offset   # Forward/back body velocity.
-        vy = self.ALIGN_KP * x_offset   # Left/right body velocity.
-        vz = 0.0                         # Hold altitude.
-
-        # Clamp velocities to configured max.
-        max_speed = self.config["flight"]["max_horizontal_speed_m_s"]
-        vx = max(-max_speed, min(max_speed, vx))
-        vy = max(-max_speed, min(max_speed, vy))
-
-        # Send velocity command (must be sent continuously at high rate).
-        self._send("move_local_vel", vx=vx, vy=vy, vz=vz)
-
-        # Check if centered.
-        error = math.sqrt(x_offset ** 2 + y_offset ** 2)
-        if error < self.ALIGN_CENTERED_THRESHOLD_M:
-            self._centered_ticks += 1
-        else:
-            self._centered_ticks = 0
-
-        # Stable for long enough — transition to LAND.
-        if self._centered_ticks >= self.ALIGN_CENTERED_TICKS_REQUIRED:
-            print(
-                f"[STATE] ALIGNED — centered within {self.ALIGN_CENTERED_THRESHOLD_M}m "
-                f"for {self.ALIGN_CENTERED_TICKS_REQUIRED / 50:.1f}s. Initiating landing."
-            )
-            self._transition_to(FlightState.LAND)
-
-    def _update_land(self):
-        """LAND: Execute precision landing using LANDING_TARGET messages.
-
-        Continuously sends the marker's BODY_FRD position to the Pixhawk.
-        If the marker is lost, ArduCopter continues landing at the last
-        known position (opportunistic precision landing).
+        Touchdown:
+            altitude < 0.15m AND disarmed → COMPLETE.
         """
         elapsed = time.time() - self.state_entry_time
 
         # Timeout — force completion.
-        if elapsed > self.timeout_land:
-            print("[STATE] LAND TIMEOUT — assuming touchdown.")
+        if elapsed > self.timeout_descend:
+            print("[STATE] DESCEND TIMEOUT — assuming touchdown.")
             self._send("set_mode", mode="LAND")
             self._transition_to(FlightState.COMPLETE)
             return
@@ -374,52 +325,50 @@ class MissionController:
             body_y = target["x_offset_m"]     # Right.
             body_z = max(altitude, 0.1)       # Down (altitude, clamped to avoid z=0 error).
 
-            target_frd = (body_x, body_y, body_z)
-
-            if not self._land_initiated:
-                # First call — initiate landing mode AND send target.
-                self._send("land_on_target", target=list(target_frd))
-                # Also explicitly set LAND mode in case land_on_target
-                # doesn't trigger it on the first try.
-                self._land_initiated = True
-                print(f"[STATE] Precision landing initiated. Target FRD: ({body_x:.3f}, {body_y:.3f}, {body_z:.3f})")
+            if not self._land_cmd_sent:
+                # First detection: send target position AND initiate LAND mode.
+                self._send("land_on_target",
+                           target=[body_x, body_y, body_z],
+                           initiate_landing=True)
+                self._land_cmd_sent = True
+                print(
+                    f"[STATE] Precision landing initiated. "
+                    f"Target FRD: ({body_x:.3f}, {body_y:.3f}, {body_z:.3f})"
+                )
             else:
-                # Subsequent calls — just update the target position.
-                self._send("land_on_target", target=list(target_frd))
+                # Subsequent ticks: just update the target position.
+                self._send("land_on_target",
+                           target=[body_x, body_y, body_z])
         else:
             # Marker not visible — if we haven't initiated landing yet, do it blind.
-            if not self._land_initiated:
-                self._send("land")
-                self._land_initiated = True
+            if not self._land_cmd_sent:
+                self._send("set_mode", mode="LAND")
+                self._land_cmd_sent = True
                 print("[STATE] Marker not visible — landing at current position.")
+            # If landing is already in progress and we lost the marker,
+            # ArduPilot continues descending at the last known position.
 
-    def _update_complete(self):
-        """COMPLETE: Post-landing cleanup. Log results and prepare for next cycle."""
-        self.attempt += 1
-        probes = self.vision.get_detected_probes()
+    # ==================================================================
+    # LED indicator
+    # ==================================================================
 
-        print(f"\n{'='*60}")
-        print(f"[STATE] ATTEMPT {self.attempt}/{self.num_landings} COMPLETE")
-        if probes:
-            print(f"[STATE] Probes detected in sectors: {', '.join(probes)}")
-        else:
-            print("[STATE] No probes detected this attempt.")
-        print(f"{'='*60}\n")
+    def _update_led_indicator(self):
+        """Update LED indicator (Green = Manual control, Red = Autonomous execution)."""
+        if self.led is None:
+            return
 
-        if self.attempt >= self.num_landings:
-            print("[STATE] All landing attempts finished. MISSION DONE.")
-            # Final probe report.
-            all_probes = self.vision.get_detected_probes()
-            if all_probes:
-                print(f"[STATE] FINAL PROBE REPORT: {', '.join(all_probes)}")
-            self._transition_to(FlightState.MISSION_DONE)
-        else:
-            print(
-                f"[STATE] Waiting for manual reposition to takeoff pad. "
-                f"({self.num_landings - self.attempt} attempts remaining)"
-            )
-            # Don't clear probes here — probes accumulate across the whole mission.
-            self._transition_to(FlightState.IDLE)
+        is_autonomous_state = self.state in (
+            FlightState.TAKEOFF,
+            FlightState.SEARCH,
+            FlightState.DESCEND,
+        )
+
+        mode = self.telem.get("mode", "GUIDED") if self.telem else "GUIDED"
+        is_manual_mode = mode in ("LOITER", "ALT_HOLD", "STABILIZE", "POSHOLD", "RTL", "MANUAL")
+
+        # Autonomous execution requires autonomous state AND active guided mode.
+        is_autonomous = is_autonomous_state and not is_manual_mode
+        self.led.update_state(is_autonomous)
 
     # ==================================================================
     # Internal helpers
@@ -434,8 +383,7 @@ class MissionController:
         # Reset state-specific variables.
         self._takeoff_phase = 0
         self._takeoff_cmd_time = 0.0
-        self._centered_ticks = 0
-        self._land_initiated = False
+        self._land_cmd_sent = False
 
         print(f"[STATE] {old} -> {new_state.value}")
 
