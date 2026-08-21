@@ -183,19 +183,19 @@ class VisionBridge:
             self._latest_marker_id = marker_id
             # Negate X: camera is mounted with X-axis inverted relative
             # to the drone's right direction.
-            self._latest_x = -msg.x
-            self._latest_y = msg.y
+            self._latest_x = msg.y
+            self._latest_y = -msg.x
             self._last_detection_time = time.time()
 
         elif marker_id < 0:
             # Probe detection. x, y are world position relative to takeoff pad.
             if self._grid_mapper is not None:
-                sector = self._grid_mapper.position_to_sector(msg.x, msg.y)
+                sector = self._grid_mapper.position_to_sector(msg.y, msg.x)
                 if sector is not None:
                     if sector not in self._detected_probe_sectors:
                         self._node.get_logger().info(
                             f"New probe detected in sector {sector} "
-                            f"(position: x={msg.x:.2f}, y={msg.y:.2f})"
+                            f"(position: x={msg.y:.2f}, y={msg.x:.2f})"
                         )
                     self._detected_probe_sectors.add(sector)
 
