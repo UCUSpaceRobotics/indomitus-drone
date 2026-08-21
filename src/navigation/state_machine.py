@@ -1,7 +1,7 @@
 """Autonomous flight state machine for ERC 2026 Droning Sub-Task.
 
 Implements a single mission cycle:
-    IDLE → TAKEOFF → SEARCH → DESCEND → COMPLETE
+    IDLE -> TAKEOFF -> SEARCH -> DESCEND -> COMPLETE
 
 The drone is manually placed on the takeoff platform before each run.
 The program executes one mission and exits. Restart it for each attempt.
@@ -64,6 +64,9 @@ class MissionController:
     # Maximum horizontal distance from takeoff origin before emergency LAND (meters).
     MAX_DISTANCE_FROM_ORIGIN_M = 3.0
 
+    # Consecutive valid vision detection frames required before transitioning from SEARCH to DESCEND (~100ms at 50Hz).
+    SEARCH_CONFIRM_TICKS = 5
+
     def __init__(self, command_queue, telemetry_queue, vision_bridge, config: dict, led_indicator=None):
         self.cmd_q = command_queue
         self.telem_q = telemetry_queue
@@ -91,10 +94,13 @@ class MissionController:
         self._takeoff_phase = 0  # 0=loiter, 1=arm, 2=guided, 3=takeoff_cmd, 4=climbing
         self._takeoff_cmd_time = 0.0
 
+        # SEARCH state tracking (consecutive detection debounce).
+        self._search_detect_ticks = 0
+
         # DESCEND state tracking.
         self._land_cmd_sent = False
 
-        print("[STATE] MissionController initialized — single mission run.")
+        print("[STATE] MissionController initialized - single mission run.")
         print(f"[STATE] Starting in {self.state.value}")
         self._update_led_indicator()
 
@@ -152,7 +158,7 @@ class MissionController:
 
         if distance > self.MAX_DISTANCE_FROM_ORIGIN_M:
             print(
-                f"[STATE] ⚠️ GEOFENCE BREACH — {distance:.2f}m from origin "
+                f"[STATE] [GEOFENCE BREACH] {distance:.2f}m from origin "
                 f"(limit: {self.MAX_DISTANCE_FROM_ORIGIN_M}m). Emergency LAND."
             )
             self._send("set_mode", mode="LAND")
@@ -181,7 +187,7 @@ class MissionController:
             self._log_throttled("Waiting for EKF to converge...")
             return
 
-        # Both conditions met — clear to take off.
+        # Both conditions met - clear to take off.
         print("[STATE] Pixhawk connected, EKF healthy. Starting mission.")
         self._transition_to(FlightState.TAKEOFF)
 
@@ -201,7 +207,7 @@ class MissionController:
 
         # Timeout failsafe.
         if elapsed > self.timeout_takeoff:
-            print("[STATE] TAKEOFF TIMEOUT — commanding LAND.")
+            print("[STATE] TAKEOFF TIMEOUT - commanding LAND.")
             self._send("set_mode", mode="LAND")
             self._transition_to(FlightState.COMPLETE)
             return
@@ -253,14 +259,17 @@ class MissionController:
         The 120-degree wide-angle lens at 2m altitude covers ~7x5m, which
         should encompass the entire 3m search radius.
 
+        Requires SEARCH_CONFIRM_TICKS consecutive detection frames before
+        transitioning to DESCEND to reject transient visual glitches.
+
         TODO: Add expanding square spiral or grid sweep pattern if the
         hover-and-look approach doesn't cover enough area.
         """
         elapsed = time.time() - self.state_entry_time
 
-        # Timeout — land wherever we are (counts as a failed attempt).
+        # Timeout - land wherever we are (counts as a failed attempt).
         if elapsed > self.timeout_search:
-            print("[STATE] SEARCH TIMEOUT — no marker found. Commanding LAND.")
+            print("[STATE] SEARCH TIMEOUT - no marker found. Commanding LAND.")
             self._send("set_mode", mode="LAND")
             self._transition_to(FlightState.COMPLETE)
             return
@@ -268,11 +277,15 @@ class MissionController:
         # Check vision for landing target.
         target = self.vision.get_latest_target()
         if target is not None and target["marker_id"] == self.landing_target_id:
-            print(
-                f"[STATE] Landing target DETECTED at offset "
-                f"({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m"
-            )
-            self._transition_to(FlightState.DESCEND)
+            self._search_detect_ticks += 1
+            if self._search_detect_ticks >= self.SEARCH_CONFIRM_TICKS:
+                print(
+                    f"[STATE] Landing target CONFIRMED ({self._search_detect_ticks} frames) at offset "
+                    f"({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m"
+                )
+                self._transition_to(FlightState.DESCEND)
+        else:
+            self._search_detect_ticks = 0
 
     def _update_descend(self):
         """DESCEND: Precision landing using ArduPilot's LANDING_TARGET system.
@@ -282,24 +295,26 @@ class MissionController:
         messages. ArduPilot's internal precision landing PID controller
         handles horizontal alignment during the descent.
 
-        On first detection:
+        On first confirmed detection in this state:
             1. Send LANDING_TARGET message with target position.
-            2. Send MAV_CMD_NAV_LAND to initiate the descent.
+            2. Send MAV_CMD_NAV_LAND (initiate_landing=True) to begin precision descent.
 
-        Every subsequent tick:
-            - If the marker is visible: send updated LANDING_TARGET.
-            - If the marker is lost: stop sending. ArduPilot continues
-              descending vertically at the last known position
-              (opportunistic precision landing behavior).
+        During descent:
+            - If target is visible: send updated LANDING_TARGET at 50 Hz.
+            - If target is temporarily lost: ArduPilot continues descent at last
+              known location (opportunistic precision landing). As soon as the
+              target is reacquired, updates resume seamlessly.
+            - If target was lost before landing was initiated: return to SEARCH to
+              maintain hover and continue looking.
 
         Touchdown:
-            altitude < 0.15m AND disarmed → COMPLETE.
+            altitude < 0.15m AND disarmed -> COMPLETE.
         """
         elapsed = time.time() - self.state_entry_time
 
-        # Timeout — force completion.
+        # Timeout failsafe - force completion if landing takes too long.
         if elapsed > self.timeout_descend:
-            print("[STATE] DESCEND TIMEOUT — assuming touchdown.")
+            print("[STATE] DESCEND TIMEOUT - assuming touchdown.")
             self._send("set_mode", mode="LAND")
             self._transition_to(FlightState.COMPLETE)
             return
@@ -318,35 +333,42 @@ class MissionController:
 
         if target is not None and target["marker_id"] == self.landing_target_id:
             # Convert camera-frame offsets to BODY_FRD for LANDING_TARGET message.
-            # Camera Y offset (forward) → body X (forward)
-            # Camera X offset (right)   → body Y (right)
-            # Altitude                  → body Z (down) — must be positive
+            # Camera Y offset (forward) -> body X (forward)
+            # Camera X offset (right)   -> body Y (right)
+            # Altitude                  -> body Z (down) - must be positive
             body_x = target["y_offset_m"]     # Forward.
             body_y = target["x_offset_m"]     # Right.
             body_z = max(altitude, 0.1)       # Down (altitude, clamped to avoid z=0 error).
 
             if not self._land_cmd_sent:
-                # First detection: send target position AND initiate LAND mode.
-                self._send("land_on_target",
-                           target=[body_x, body_y, body_z],
-                           initiate_landing=True)
+                # First detection in DESCEND: initiate precision LAND mode.
+                self._send(
+                    "land_on_target",
+                    target=[body_x, body_y, body_z],
+                    initiate_landing=True,
+                )
                 self._land_cmd_sent = True
                 print(
                     f"[STATE] Precision landing initiated. "
                     f"Target FRD: ({body_x:.3f}, {body_y:.3f}, {body_z:.3f})"
                 )
             else:
-                # Subsequent ticks: just update the target position.
-                self._send("land_on_target",
-                           target=[body_x, body_y, body_z])
+                # Subsequent ticks: update target coordinates for active precision descent.
+                self._send(
+                    "land_on_target",
+                    target=[body_x, body_y, body_z],
+                    initiate_landing=False,
+                )
         else:
-            # Marker not visible — if we haven't initiated landing yet, do it blind.
+            # Marker not visible in this tick.
             if not self._land_cmd_sent:
-                self._send("set_mode", mode="LAND")
-                self._land_cmd_sent = True
-                print("[STATE] Marker not visible — landing at current position.")
-            # If landing is already in progress and we lost the marker,
-            # ArduPilot continues descending at the last known position.
+                # Target was lost before landing even started - fall back to SEARCH to hover and look again.
+                print("[STATE] Target lost before landing initiated - returning to SEARCH.")
+                self._transition_to(FlightState.SEARCH)
+            else:
+                # Landing is already underway: ArduPilot continues descent at last known position.
+                # When target reappears, next tick will resume sending LANDING_TARGET updates.
+                pass
 
     # ==================================================================
     # LED indicator
@@ -383,6 +405,7 @@ class MissionController:
         # Reset state-specific variables.
         self._takeoff_phase = 0
         self._takeoff_cmd_time = 0.0
+        self._search_detect_ticks = 0
         self._land_cmd_sent = False
 
         print(f"[STATE] {old} -> {new_state.value}")
