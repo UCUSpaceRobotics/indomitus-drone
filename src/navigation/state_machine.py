@@ -140,6 +140,7 @@ class MissionController:
         elif self.state == FlightState.DESCEND:
             self._update_descend()
         # COMPLETE: do nothing, main loop will exit.
+        self._update_target()
 
         self._update_led_indicator()
 
@@ -288,7 +289,7 @@ class MissionController:
             if self._search_attempts >= 3:
                 print("[STATE] Maximum search attempts reached. Commanding LAND.")
                 self._send("set_mode", mode="LAND")
-                self._transition_to(FlightState.COMPLETE)
+                self._transition_to(FlightState.DESCEND)
                 return
 
             print("[STATE] Searching for landing target marker...")
@@ -303,7 +304,6 @@ class MissionController:
                 print("[STATE] Hovering forward 1m complete, continuing search...")
                 self._search_phase = 1  # Loop back to maintain hover.
 
-        self._update_target()
 
     def _update_target(self):
         """Check for landing target detection and handle transition to DESCEND."""
@@ -313,13 +313,13 @@ class MissionController:
         if target is not None and target["marker_id"] == self.landing_target_id:
             self._search_detect_ticks += 1
             self._send("send_landing_target", target=[target["x_offset_m"], target["y_offset_m"], self._get_altitude()])
-            print(f"[STATE] Landing target detected at offset ({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m")
+            # print(f"[STATE] Landing target detected at offset ({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m")
             if self._search_detect_ticks >= self.SEARCH_CONFIRM_TICKS:
                 print(
                     f"[STATE] Landing target CONFIRMED ({self._search_detect_ticks} frames) at offset "
                     f"({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m"
                 )
-                # self._transition_to(FlightState.DESCEND)
+                self._transition_to(FlightState.DESCEND)
         else:
             self._search_detect_ticks = 0
 
@@ -364,47 +364,6 @@ class MissionController:
             self._transition_to(FlightState.COMPLETE)
             return
 
-        # Get latest target for precision landing updates.
-        target = self.vision.get_latest_target()
-
-        if target is not None and target["marker_id"] == self.landing_target_id:
-            # Convert camera-frame offsets to BODY_FRD for LANDING_TARGET message.
-            # Camera Y offset (forward) -> body X (forward)
-            # Camera X offset (right)   -> body Y (right)
-            # Altitude                  -> body Z (down) - must be positive
-            body_x = target["x_offset_m"]     # Forward.
-            body_y = target["y_offset_m"]     # Right.
-            body_z = max(altitude, 0.1)       # Down (altitude, clamped to avoid z=0 error).
-
-            if not self._land_cmd_sent:
-                # First detection in DESCEND: initiate precision LAND mode.
-                self._send(
-                    "land_on_target",
-                    target=[body_x, body_y, body_z],
-                    initiate_landing=True,
-                )
-                self._land_cmd_sent = True
-                print(
-                    f"[STATE] Precision landing initiated. "
-                    f"Target FRD: ({body_x:.3f}, {body_y:.3f}, {body_z:.3f})"
-                )
-            else:
-                # Subsequent ticks: update target coordinates for active precision descent.
-                self._send(
-                    "land_on_target",
-                    target=[body_x, body_y, body_z],
-                    initiate_landing=False,
-                )
-        else:
-            # Marker not visible in this tick.
-            if not self._land_cmd_sent:
-                # Target was lost before landing even started - fall back to SEARCH to hover and look again.
-                print("[STATE] Target lost before landing initiated - returning to SEARCH.")
-                self._transition_to(FlightState.SEARCH)
-            else:
-                # Landing is already underway: ArduPilot continues descent at last known position.
-                # When target reappears, next tick will resume sending LANDING_TARGET updates.
-                pass
 
     # ==================================================================
     # LED indicator

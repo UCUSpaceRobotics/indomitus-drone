@@ -42,7 +42,7 @@ def main():
         time.sleep(2)
 
         # 4. Зліт (Тестовий)
-        TARGET_ALTITUDE = 2.0
+        TARGET_ALTITUDE = 1.5
         print(f"\n>>> КРОК 3: Команда TAKEOFF (Зліт на {TARGET_ALTITUDE} метри)...")
         command_queue.put(create_command("takeoff", altitude=TARGET_ALTITUDE))
 
@@ -81,7 +81,7 @@ def main():
             return
 
         # 5. Моніторинг польоту / висіння у повітрі
-        FLIGHT_DURATION = 7.0  # Час висіння у секундах
+        FLIGHT_DURATION = 3.0  # Час висіння у секундах
         print(f"\n>>> КРОК 4: Моніторинг телеметрії у польоті ({FLIGHT_DURATION} секунд)...")
         start_time = time.time()
 
@@ -142,9 +142,9 @@ def main():
         # command_queue.put(create_command("move_local_pos", dx=0.0, dy=1.0, dz=0.0))
         # time.sleep(3) # Час на виконання руху
 
-        # # 8. Моніторинг польоту / висіння у повітрі
+        # # 7. Моніторинг польоту / висіння у повітрі
         # FLIGHT_DURATION = 3.0  # Час висіння у секундах
-        # print(f"\n>>> КРОК 8: Моніторинг телеметрії у польоті ({FLIGHT_DURATION} секунд)...")
+        # print(f"\n>>> КРОК 7: Моніторинг телеметрії у польоті ({FLIGHT_DURATION} секунд)...")
         # start_time = time.time()
 
         # while (time.time() - start_time) < FLIGHT_DURATION:
@@ -168,6 +168,38 @@ def main():
         #     time.sleep(0.2) # Оновлення 5 разів на секунду
 
         # print() # Перенесення рядка після завершення циклу
+
+        # # # 8. Рух 1м вправо (по осі X у локальній системі координат)
+        # # print("\n>>> КРОК 8: Рух на 1 метр вправо (по осі X у локальній системі координат)...")
+        # # command_queue.put(create_command("move_local_pos", dx=0.0, dy=1.0, dz=0.0))
+        # # time.sleep(3) # Час на виконання руху
+
+        # # # 8. Моніторинг польоту / висіння у повітрі
+        # # FLIGHT_DURATION = 3.0  # Час висіння у секундах
+        # # print(f"\n>>> КРОК 8: Моніторинг телеметрії у польоті ({FLIGHT_DURATION} секунд)...")
+        # # start_time = time.time()
+
+        # # while (time.time() - start_time) < FLIGHT_DURATION:
+        # #     try:
+        # #         # Дістаємо найсвіжіший словник телеметрії
+        # #         telem = telemetry_queue.get(timeout=0.1)
+
+        # #         # Z-координата в NED йде вниз від точки старту, інвертуємо для реальної висоти
+        # #         alt_m = -telem.get('pos_z_m', 0.0)
+        # #         mode = telem.get('mode', 'UNKNOWN')
+        # #         armed = "ТАК" if telem.get('armed') else "НІ"
+        # #         batt = telem.get('battery_voltage_v', 0.0)
+
+        # #         # Друк телеметрії в один рядок
+        # #         sys.stdout.write(f"\r[ТЕЛЕМЕТРІЯ] Режим: {mode:^8} | Арм: {armed:^3} | Висота: {alt_m:>5.2f}м | Батарея: {batt:>5.1f}V ")
+        # #         sys.stdout.flush()
+
+        # #     except queue.Empty:
+        # #         pass
+
+        # #     time.sleep(0.2) # Оновлення 5 разів на секунду
+
+        # # print() # Перенесення рядка після завершення циклу
 
         # 8. Автоматична посадка
         print("\n>>> КРОК 8: Виконання місії завершено. Команда LAND (Посадка)...")
