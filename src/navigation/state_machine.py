@@ -303,6 +303,10 @@ class MissionController:
                 print("[STATE] Hovering forward 1m complete, continuing search...")
                 self._search_phase = 1  # Loop back to maintain hover.
 
+        self._update_target()
+
+    def _update_target(self):
+        """Check for landing target detection and handle transition to DESCEND."""
 
         # Check vision for landing target.
         target = self.vision.get_latest_target()
@@ -315,7 +319,7 @@ class MissionController:
                     f"[STATE] Landing target CONFIRMED ({self._search_detect_ticks} frames) at offset "
                     f"({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m"
                 )
-                self._transition_to(FlightState.DESCEND)
+                # self._transition_to(FlightState.DESCEND)
         else:
             self._search_detect_ticks = 0
 
