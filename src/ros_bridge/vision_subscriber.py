@@ -187,10 +187,10 @@ class VisionBridge:
             self._latest_y = -msg.x
             self._last_detection_time = time.time()
 
-            self._node.get_logger().info(
-                f"Landing target {marker_id}ID detected at offset "
-                f"(x={self._latest_x:.2f}, y={self._latest_y:.2f})"
-            )
+            # self._node.get_logger().info(
+            #     f"Landing target {marker_id}ID detected at offset "
+            #     f"(x={self._latest_x:.2f}, y={self._latest_y:.2f})"
+            # )
 
         elif marker_id < 0:
             # Probe detection. x, y are world position relative to takeoff pad.

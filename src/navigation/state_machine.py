@@ -286,7 +286,7 @@ class MissionController:
                 print("[STATE] Hover in place for 5 seconds.")
                 self._search_phase = 1
         elif self._search_phase == 1:
-            if self._search_attempts >= 3:
+            if self._search_attempts >= 2:
                 print("[STATE] Maximum search attempts reached. Commanding LAND.")
                 self._send("set_mode", mode="LAND")
                 self._transition_to(FlightState.DESCEND)
@@ -314,11 +314,12 @@ class MissionController:
             self._search_detect_ticks += 1
             self._send("send_landing_target", target=[target["x_offset_m"], target["y_offset_m"], self._get_altitude()])
             # print(f"[STATE] Landing target detected at offset ({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m")
-            if self._search_detect_ticks >= self.SEARCH_CONFIRM_TICKS:
+            if self.state != FlightState.DESCEND and self._search_detect_ticks >= self.SEARCH_CONFIRM_TICKS:
                 print(
                     f"[STATE] Landing target CONFIRMED ({self._search_detect_ticks} frames) at offset "
                     f"({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m"
                 )
+                print("[STATE] Transitioning to DESCEND.")
                 self._transition_to(FlightState.DESCEND)
         else:
             self._search_detect_ticks = 0
