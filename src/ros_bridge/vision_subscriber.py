@@ -41,7 +41,7 @@ MARKER_ID_ORIGIN = 101
 MARKER_ID_LANDING = 102
 
 # How old a detection can be before we consider it stale.
-DEFAULT_DETECTION_TIMEOUT_S = 0.5
+DEFAULT_DETECTION_TIMEOUT_S = 0.05
 
 
 class _VisionSubscriberNode(Node):
