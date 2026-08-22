@@ -137,7 +137,7 @@ def camera_thread():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
             # Draw vector pointing from drone center to target
-            px_offset_x = int(m_y * 350)
+            px_offset_x = -int(m_y * 350)
             px_offset_y = int(m_x * 350)
             target_px = (cx + px_offset_x, cy + px_offset_y)
             cv2.arrowedLine(frame, (cx, cy), target_px, color, 2, tipLength=0.2)
