@@ -131,14 +131,14 @@ def camera_thread():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
             cv2.putText(frame, f"TARGET: {marker_name}", (20, 78),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
-            cv2.putText(frame, f"X OFFSET: {m_x:+.3f} m  (Right)", (20, 100),
+            cv2.putText(frame, f"X OFFSET: {m_x:+.3f} m  (Forward)", (20, 100),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-            cv2.putText(frame, f"Y OFFSET: {m_y:+.3f} m  (Forward)", (20, 122),
+            cv2.putText(frame, f"Y OFFSET: {m_y:+.3f} m  (Right)", (20, 122),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
             # Draw vector pointing from drone center to target
-            px_offset_x = int(m_x * 350)
-            px_offset_y = int(m_y * 350)
+            px_offset_x = int(m_y * 350)
+            px_offset_y = int(m_x * 350)
             target_px = (cx + px_offset_x, cy + px_offset_y)
             cv2.arrowedLine(frame, (cx, cy), target_px, color, 2, tipLength=0.2)
             cv2.circle(frame, target_px, 10, color, 2)
