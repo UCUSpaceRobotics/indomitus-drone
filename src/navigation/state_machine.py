@@ -320,6 +320,8 @@ class MissionController:
                     f"({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m"
                 )
                 print("[STATE] Transitioning to DESCEND.")
+                print("[STATE] Commanding LAND.")
+                self._send("land_on_target", target=[target["x_offset_m"], target["y_offset_m"], self._get_altitude()], initiate_landing=True)
                 self._transition_to(FlightState.DESCEND)
         else:
             self._search_detect_ticks = 0
