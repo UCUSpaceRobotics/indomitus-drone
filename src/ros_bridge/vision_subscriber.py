@@ -47,12 +47,14 @@ DEFAULT_DETECTION_TIMEOUT_S = 0.05
 class _VisionSubscriberNode(Node):
     """Internal rclpy Node. Not exposed outside this module."""
 
-    def __init__(self, topic: str, on_message_callback):
+    def __init__(self, sub_topic: str, on_message_callback, pub_topic: str):
         super().__init__("vision_bridge")
         self.subscription = self.create_subscription(
-            Point, topic, on_message_callback, 10
+            Point, sub_topic, on_message_callback, 10
         )
-        self.get_logger().info(f"Subscribed to {topic}")
+        self.get_logger().info(f"Subscribed to {sub_topic}")
+        self.publisher = self.create_publisher(Point, pub_topic, 10)
+
 
 
 class VisionBridge:
@@ -96,7 +98,7 @@ class VisionBridge:
         self._msg_count: int = 0
 
         # Create the internal ROS 2 node.
-        self._node = _VisionSubscriberNode(topic, self._on_vision_msg)
+        self._node = _VisionSubscriberNode(topic, self._on_vision_msg, f"{topic}_filtered")
 
     # ------------------------------------------------------------------
     # Public API — called by the state machine
@@ -191,6 +193,7 @@ class VisionBridge:
             #     f"Landing target {marker_id}ID detected at offset "
             #     f"(x={self._latest_x:.2f}, y={self._latest_y:.2f})"
             # )
+            self._node.publisher.publish(Point(x=self._latest_x, y=self._latest_y, z=marker_id))
 
         elif marker_id < 0:
             # Probe detection. x, y are world position relative to takeoff pad.

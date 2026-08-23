@@ -25,11 +25,14 @@ Usage:
 from __future__ import annotations
 
 import math
+import multiprocessing
 import queue
 import time
 from enum import Enum
 
 from src.comm.mavlink_node import create_command
+from src.ros_bridge.vision_subscriber import VisionBridge
+from src.utils.led_indicator import LEDController
 
 
 class FlightState(Enum):
@@ -67,7 +70,8 @@ class MissionController:
     # Consecutive valid vision detection frames required before transitioning from SEARCH to DESCEND (~100ms at 50Hz).
     SEARCH_CONFIRM_TICKS = 5
 
-    def __init__(self, command_queue, telemetry_queue, vision_bridge, config: dict, led_indicator=None):
+    def __init__(self, command_queue: multiprocessing.Queue, telemetry_queue: multiprocessing.Queue,
+                 vision_bridge: VisionBridge, config: dict, led_indicator: LEDController | None = None):
         self.cmd_q = command_queue
         self.telem_q = telemetry_queue
         self.vision = vision_bridge
@@ -312,17 +316,15 @@ class MissionController:
         target = self.vision.get_latest_target()
         if target is not None and target["marker_id"] == self.landing_target_id:
             self._search_detect_ticks += 1
-            self._send("send_landing_target", target=[target["x_offset_m"], target["y_offset_m"], self._get_altitude()])
-            # print(f"[STATE] Landing target detected at offset ({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m")
             if self.state != FlightState.DESCEND and self._search_detect_ticks >= self.SEARCH_CONFIRM_TICKS:
                 print(
                     f"[STATE] Landing target CONFIRMED ({self._search_detect_ticks} frames) at offset "
                     f"({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m"
                 )
                 print("[STATE] Transitioning to DESCEND.")
-                print("[STATE] Commanding LAND.")
-                self._send("land_on_target", target=[target["x_offset_m"], target["y_offset_m"], self._get_altitude()], initiate_landing=True)
                 self._transition_to(FlightState.DESCEND)
+                print("[STATE] Commanding LAND.")
+                self._send("set_mode", mode="LAND")
         else:
             self._search_detect_ticks = 0
 

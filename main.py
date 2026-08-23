@@ -26,6 +26,8 @@ import time
 
 import yaml
 
+from src.navigation.LandingTargetSender import LandingTargetSender
+
 
 def load_config(path: str = "config/mission_params.yaml") -> dict:
     """Load and return the mission configuration from YAML."""
@@ -113,6 +115,7 @@ def main():
     # ------------------------------------------------------------------
     from src.ros_bridge.vision_subscriber import VisionBridge
 
+    # publishes coordinates to f"{topic}_filtered", which is subscribed to by the LandingTargetSender node
     vision = VisionBridge(
         topic=config["ros2"]["vision_topic"],
         grid_config=config["grid"],
@@ -132,6 +135,14 @@ def main():
         led_indicator=led,
     )
     print("[MAIN] MissionController created — state machine ready.")
+
+
+    landing_target_sender = LandingTargetSender(
+        topic=f"{config['ros2']['vision_topic']}_filtered",
+        command_queue=command_queue,
+        telemetry_queue=telemetry_queue,
+        landing_target_id=102,
+    )
 
     # ------------------------------------------------------------------
     # 9. Main loop
