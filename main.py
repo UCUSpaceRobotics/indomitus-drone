@@ -153,6 +153,7 @@ def main():
 
     try:
         while mission.state != FlightState.COMPLETE:
+            landing_target_sender.spin_once()  # Process any incoming vision messages
             mission.update()
             time.sleep(0.02)  # 50 Hz — balances responsiveness and CPU usage.
 

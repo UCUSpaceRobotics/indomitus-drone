@@ -1,6 +1,7 @@
 
 import multiprocessing
 
+import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Point
 from src.comm.mavlink_node import create_command
@@ -20,7 +21,17 @@ class LandingTargetSender(Node):
         self.cmd_q = command_queue
         self.telem_q = telemetry_queue
         self.landing_target_id = landing_target_id
+        self.telem = {}
 
+    def spin_once(self):
+        """
+        Process any incoming messages and publish the landing target position.
+        """
+        rclpy.spin_once(self, timeout_sec=0.01)  # Non-blocking spin
+        try:
+            self.telem = self.telem_q.get_nowait()  # Get the latest telemetry data
+        except multiprocessing.queues.Empty:
+            self.telem = {}
 
     def _send(self, action: str, **kwargs):
         """Send a command to the MAVLink comm process via the command queue."""
