@@ -293,7 +293,6 @@ class TestFlightController:
             #     self._transition_to(FlightState.DESCEND)
             #     return
 
-            print("[STATE] Searching for landing target marker...")
             if self._move_local_ned(dx=0.5, dy=2.5, dz=0.0):  # Move forward 2.5m
                 self._search_phase = 2
                 self._send("set_mode", mode="LAND")
