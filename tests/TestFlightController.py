@@ -103,6 +103,7 @@ class TestFlightController:
 
         self._search_phase = 0  # 0=hover, 1=hover forward, 2=searching
         self._initiate_movement_time = time.time()  # Time when movement command was sent
+        self._is_movement_initiated = False  # Flag to track if movement command is in progress
         self._search_attempts = 0  # Count of search attempts (hover forward cycles)
 
         print("[STATE] TestFlightController initialized - single mission run.")
@@ -293,47 +294,10 @@ class TestFlightController:
             #     return
 
             print("[STATE] Searching for landing target marker...")
-            self._send("move_local_pos", dx=2.5, dy=0.0, dz=0.0)  # Maintain hover.
-            print("[STATE] Hovering forward 2.5m")
-            self._initiate_movement_time = time.time()
-            self._search_attempts += 1
-            self._search_phase = 2  # Move to phase 2 to wait for hover completion.
-        elif self._search_phase == 2:
-            # Phase 2: Maintain hover and check for marker detection.
-            if time.time() - self._initiate_movement_time >= self.timeout_alignment:
-                print("[STATE] Hovering forward 2.5m complete")
-                self._search_phase = 3  # Loop back to maintain hover.
-        elif self._search_phase == 3:
-
-            self._send("move_local_pos", dx=0.0, dy=0.5, dz=0.0)  # Move sideways to sweep the area.
-            print("[STATE] Sweeping sideways 0.5m")
-            self._initiate_movement_time = time.time()
-            self._search_phase = 4  # Move to phase 4 to wait for hover completion.
-        elif self._search_phase == 4:
-            if time.time() - self._initiate_movement_time >= self.timeout_alignment:
-                print("[STATE] Sweeping sideways 0.5m complete")
-                self._search_phase = 5  # Loop back to maintain hover.
-        elif self._search_phase == 5:
-            self._send("move_local_pos", dx=0.0, dy=-1.0, dz=0.0)  # Move left to return to original position.
-            print("[STATE] moving left 1.0m")
-            self._initiate_movement_time = time.time()
-            self._search_phase = 6  # Move to phase 6 to wait for hover completion.
-        elif self._search_phase == 6:
-            if time.time() - self._initiate_movement_time >= self.timeout_alignment:
-                print("[STATE] moving left 1.0m complete")
-                self._search_phase = 7  # Loop back to maintain hover and continue searching.
-        elif self._search_phase == 7:
-            self._send("move_local_pos", dx=-2.5, dy=0.5, dz=0.0)  # Move left to return to original position.
-            self._search_phase = 8  # Move to phase 8 to wait for hover completion.
-        elif self._search_phase == 8:
-            if time.time() - self._initiate_movement_time >= self.timeout_alignment:
-                print("[STATE] moving back (2.5m, 0.5m) complete")
-                # self._search_phase = 9  # Loop back to maintain hover and continue searching.
-                print("[STATE] Search finished. Commanding LAND.")
+            if self._move_local_ned(dx=0.5, dy=2.5, dz=0.0):  # Move forward 2.5m
+                self._search_phase = 2
                 self._send("set_mode", mode="LAND")
                 self._transition_to(FlightState.DESCEND)
-                return
-
 
 
     def _update_target(self):
@@ -356,6 +320,28 @@ class TestFlightController:
                 self._transition_to(FlightState.DESCEND)
         else:
             self._search_detect_ticks = 0
+
+    def _move_local_ned(self, dx: float, dy: float, dz: float):
+        """Send a local NED position command to the drone.
+
+        Args:
+            dx: Forward/backward offset in meters (positive = forward).
+            dy: Left/right offset in meters (positive = right).
+            dz: Up/down offset in meters (positive = down).
+        """
+        if not self._is_movement_initiated:
+            print(f"[STATE] Sending local NED movement command: dx={dx:.2f}, dy={dy:.2f}, dz={dz:.2f}")
+            self._send("move_local_pos", dx=dx, dy=dy, dz=dz)
+            self._initiate_movement_time = time.time()
+            self._is_movement_initiated = True
+
+        else :
+            if time.time() - self._initiate_movement_time >= self.timeout_alignment:
+                print("[STATE] Movement command completed.")
+                self._is_movement_initiated = False
+                return True
+
+        return False  # Movement command still in progress.
 
     def _update_descend(self):
         """DESCEND: Precision landing using ArduPilot's LANDING_TARGET system.
