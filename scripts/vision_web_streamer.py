@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vision Web Streamer — Streams camera frames with Simulink ROS 2 overlays over HTTP.
+"""Vision Web Streamer — Streams camera frames with VisionBridge overlays over HTTP.
 
 Usage on Raspberry Pi:
     source /opt/ros/jazzy/setup.bash
@@ -7,26 +7,30 @@ Usage on Raspberry Pi:
     python3 scripts/vision_web_streamer.py
 """
 
-import cv2
+import os
+from pathlib import Path
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
+import cv2
 import rclpy
-from rclpy.node import Node
-from geometry_msgs.msg import Point
+import yaml
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from src.ros_bridge.vision_subscriber import MARKER_ID_LANDING, VisionBridge
 
 
 class SharedState:
     def __init__(self):
         self.lock = threading.Lock()
         self.latest_frame = None
-        self.marker_id = 0.0
-        self.x_offset = 0.0
-        self.y_offset = 0.0
-        self.last_ros_time = 0.0
+        self.latest_target = None
         self.fps = 0.0
         self.cam_connected = False
 
@@ -34,33 +38,25 @@ class SharedState:
 state = SharedState()
 
 
-# ── ROS 2 Subscriber ────────────────────────────────────────────────────────
-class VisionListenerNode(Node):
-    def __init__(self):
-        super().__init__("vision_web_listener")
-        self.sub = self.create_subscription(
-            Point, "/erc/vision_targets", self.callback, 10
-        )
-        self.get_logger().info("Subscribed to /erc/vision_targets")
-
-    def callback(self, msg: Point):
-        with state.lock:
-            state.x_offset = msg.x
-            state.y_offset = msg.y
-            state.marker_id = msg.z
-            state.last_ros_time = time.time()
-
-
-def ros_spin_thread():
+# ── VisionBridge Polling ────────────────────────────────────────────────────
+def ros_spin_thread(config):
     rclpy.init()
-    node = VisionListenerNode()
+    bridge = VisionBridge(
+        topic=config["ros2"]["vision_topic"],
+        grid_config=config["grid"],
+    )
     try:
-        rclpy.spin(node)
-    except Exception:
-        pass
+        while rclpy.ok():
+            bridge.spin_once()
+            with state.lock:
+                state.latest_target = bridge.get_latest_target()
+            time.sleep(0.01)
+    except Exception as error:
+        print(f"[VISION ERROR] {error}", file=sys.stderr)
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        bridge.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 # ── Camera Capture & Overlay Loop ──────────────────────────────────────────
@@ -74,13 +70,6 @@ def camera_thread():
     if not cap.isOpened():
         print("[CAMERA ERROR] Could not open /dev/video10!")
         return
-
-    # ArUco detector for corner boxes
-    try:
-        aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_ARUCO_ORIGINAL)
-        aruco_detector = cv2.aruco.ArucoDetector(aruco_dict)
-    except Exception:
-        aruco_detector = None
 
     print("[CAMERA] Capture loop running successfully.")
     frame_count = 0
@@ -113,24 +102,10 @@ def camera_thread():
         cv2.line(frame, (cx, cy - 20), (cx, cy + 20), (0, 255, 255), 1)
         cv2.circle(frame, (cx, cy), 4, (0, 255, 255), 1)
 
-        # Detect and outline ArUco corners
-        if aruco_detector is not None:
-            try:
-                corners, ids, _ = aruco_detector.detectMarkers(frame)
-                if ids is not None and len(ids) > 0:
-                    cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-            except Exception:
-                pass
-
-        # Retrieve latest ROS 2 detection data
+        # Retrieve latest detection processed by VisionBridge.
         with state.lock:
-            m_id = state.marker_id
-            m_x = state.x_offset
-            m_y = state.y_offset
-            last_t = state.last_ros_time
+            target = state.latest_target
             fps = state.fps
-
-        is_fresh = (time.time() - last_t) < 1.0
 
         # Draw HUD Box
         overlay = frame.copy()
@@ -141,29 +116,36 @@ def camera_thread():
         cv2.putText(frame, f"FPS: {fps:.1f}  |  Res: {w}x{h}", (20, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
-        if is_fresh and m_id > 0:
-            color = (0, 255, 0) if m_id == 102 else (0, 200, 255)
-            marker_name = "LANDING TARGET (102)" if m_id == 102 else "TAKEOFF PAD (101)"
+        if target is not None:
+            m_id = target["marker_id"]
+            m_x = target["x_offset_m"]
+            m_y = target["y_offset_m"]
+            color = (0, 255, 0) if m_id == MARKER_ID_LANDING else (0, 200, 255)
+            marker_name = (
+                f"LANDING TARGET ({m_id})"
+                if m_id == MARKER_ID_LANDING
+                else f"TAKEOFF PAD ({m_id})"
+            )
 
             cv2.putText(frame, "STATUS: TARGET ACQUIRED", (20, 55),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
             cv2.putText(frame, f"TARGET: {marker_name}", (20, 78),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
-            cv2.putText(frame, f"X OFFSET: {m_x:+.3f} m  (Right)", (20, 100),
+            cv2.putText(frame, f"X OFFSET: {m_x:+.3f} m  (Forward)", (20, 100),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-            cv2.putText(frame, f"Y OFFSET: {m_y:+.3f} m  (Forward)", (20, 122),
+            cv2.putText(frame, f"Y OFFSET: {m_y:+.3f} m  (Right)", (20, 122),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
             # Draw vector pointing from drone center to target
-            px_offset_x = int(m_x * 350)
-            px_offset_y = int(m_y * 350)
+            px_offset_x = -int(m_y * 350)
+            px_offset_y = int(m_x * 350)
             target_px = (cx + px_offset_x, cy + px_offset_y)
             cv2.arrowedLine(frame, (cx, cy), target_px, color, 2, tipLength=0.2)
             cv2.circle(frame, target_px, 10, color, 2)
         else:
             cv2.putText(frame, "STATUS: SEARCHING...", (20, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 100, 255), 2)
-            cv2.putText(frame, "Simulink: No active marker", (20, 90),
+            cv2.putText(frame, "VisionBridge: No active marker", (20, 90),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
 
         # Compress to JPEG
@@ -201,11 +183,11 @@ class StreamingHandler(BaseHTTPRequestHandler):
     </style>
 </head>
 <body>
-    <h2>ERC 2026 — Simulink Vision Stream</h2>
+    <h2>ERC 2026 — VisionBridge Stream</h2>
     <div class="box">
         <img src="/stream.mjpg" alt="Video Stream" />
     </div>
-    <div class="info">Live feed from /dev/video10 | Overlay from ROS 2 (/erc/vision_targets)</div>
+    <div class="info">Live feed from /dev/video10 | Overlay from VisionBridge (/erc/vision_targets)</div>
 </body>
 </html>"""
             self.wfile.write(html.encode("utf-8"))
@@ -245,7 +227,13 @@ def run_server(port=5000):
 
 
 if __name__ == "__main__":
-    t_ros = threading.Thread(target=ros_spin_thread, daemon=True)
+    config_path = REPO_ROOT / "config" / "mission_params.yaml"
+    with config_path.open(encoding="utf-8") as config_file:
+        config = yaml.safe_load(config_file)
+
+    os.environ.setdefault("ROS_DOMAIN_ID", str(config["ros2"]["domain_id"]))
+
+    t_ros = threading.Thread(target=ros_spin_thread, args=(config,), daemon=True)
     t_cam = threading.Thread(target=camera_thread, daemon=True)
     t_ros.start()
     t_cam.start()

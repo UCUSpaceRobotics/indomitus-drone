@@ -6,6 +6,9 @@ Wires together the three layers of the system:
     2. MissionController  (autonomous flight state machine)
     3. Comm process  (MAVLink communication with Pixhawk)
 
+Each invocation runs a single mission cycle (IDLE → TAKEOFF → SEARCH →
+DESCEND → COMPLETE). Restart the program for each mission attempt.
+
 Usage:
     # From the repo root, with ROS 2 environment sourced:
     sudo -E python3 main.py
@@ -18,7 +21,6 @@ from __future__ import annotations
 
 import multiprocessing
 import os
-import signal
 import sys
 import time
 
@@ -43,6 +45,7 @@ def main():
 
     print("=" * 60)
     print("  INDOMITUS DRONE — ERC 2026 Droning Sub-Task")
+    print("  Single mission run — restart for each attempt")
     print("=" * 60)
     print()
 
@@ -138,7 +141,7 @@ def main():
     print("[MAIN] Press Ctrl+C for emergency stop.\n")
 
     try:
-        while mission.state != FlightState.MISSION_DONE:
+        while mission.state != FlightState.COMPLETE:
             mission.update()
             time.sleep(0.02)  # 50 Hz — balances responsiveness and CPU usage.
 
@@ -154,13 +157,6 @@ def main():
     # 10. Shutdown
     # ------------------------------------------------------------------
     print("\n[MAIN] Shutting down...")
-
-    # Report final probe detections.
-    probes = vision.get_detected_probes()
-    if probes:
-        print(f"[MAIN] FINAL PROBE REPORT: {', '.join(probes)}")
-    else:
-        print("[MAIN] No probes detected during the mission.")
 
     # Clean up LED indicator.
     if led:
@@ -182,7 +178,7 @@ def main():
         comm_process.join(timeout=3.0)
     print("[MAIN] Comm process terminated.")
 
-    print("[MAIN] Done. Goodbye!")
+    print("[MAIN] Mission complete. Goodbye!")
 
 
 if __name__ == "__main__":
