@@ -293,15 +293,15 @@ class TestFlightController:
             #     return
 
             print("[STATE] Searching for landing target marker...")
-            self._send("move_local_pos", dx=3.0, dy=0.0, dz=0.0)  # Maintain hover.
-            print("[STATE] Hovering forward 3m")
+            self._send("move_local_pos", dx=2.5, dy=0.0, dz=0.0)  # Maintain hover.
+            print("[STATE] Hovering forward 2.5m")
             self._initiate_movement_time = time.time()
             self._search_attempts += 1
             self._search_phase = 2  # Move to phase 2 to wait for hover completion.
         elif self._search_phase == 2:
             # Phase 2: Maintain hover and check for marker detection.
             if time.time() - self._initiate_movement_time >= self.timeout_alignment:
-                print("[STATE] Hovering forward 3m complete")
+                print("[STATE] Hovering forward 2.5m complete")
                 self._search_phase = 3  # Loop back to maintain hover.
         elif self._search_phase == 3:
 
@@ -312,7 +312,24 @@ class TestFlightController:
         elif self._search_phase == 4:
             if time.time() - self._initiate_movement_time >= self.timeout_alignment:
                 print("[STATE] Sweeping sideways 0.5m complete")
-                # self._search_phase = 5  # Loop back to maintain hover.
+                self._search_phase = 5  # Loop back to maintain hover.
+        elif self._search_phase == 5:
+            self._send("move_local_pos", dx=0.0, dy=-1.0, dz=0.0)  # Move left to return to original position.
+            print("[STATE] moving left 1.0m")
+            self._initiate_movement_time = time.time()
+            self._search_phase = 6  # Move to phase 6 to wait for hover completion.
+        elif self._search_phase == 6:
+            if time.time() - self._initiate_movement_time >= self.timeout_alignment:
+                print("[STATE] moving left 1.0m complete")
+                self._search_phase = 7  # Loop back to maintain hover and continue searching.
+        elif self._search_phase == 7:
+            self._send("move_local_pos", dx=-2.5, dy=0.5, dz=0.0)  # Move left to return to original position.
+            self._search_phase = 8  # Move to phase 8 to wait for hover completion.
+        elif self._search_phase == 8:
+            if time.time() - self._initiate_movement_time >= self.timeout_alignment:
+                print("[STATE] moving back (2.5m, 0.5m) complete")
+                # self._search_phase = 9  # Loop back to maintain hover and continue searching.
+                print("[STATE] Search finished. Commanding LAND.")
                 self._send("set_mode", mode="LAND")
                 self._transition_to(FlightState.DESCEND)
                 return
