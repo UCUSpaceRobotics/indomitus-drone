@@ -570,6 +570,9 @@ class PixhawkClient:
             mavutil.mavlink.LANDING_TARGET_TYPE_VISION_FIDUCIAL,
             1,  # position_valid
         )
+        print(
+            f"[COMM] Command sent: LANDING TARGET [x:{x_m:.3f}, y:{y_m:.3f}, z:{z_m:.3f}]"
+        )
 
         if initiate_landing:
             self.land()
