@@ -19,7 +19,7 @@
 
 set -o pipefail
 
-ROS_DOMAIN_ID_VAL=42
+ROS_DOMAIN_ID_VAL=27
 ROS2_WS="$HOME/ros2_ws"
 DRONE_WS="$HOME/indomitus-drone"
 

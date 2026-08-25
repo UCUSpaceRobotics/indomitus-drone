@@ -34,7 +34,7 @@ serial:
 
 ros2:
   vision_topic: /erc/vision_targets
-  domain_id: 42
+  domain_id: 27
 
 timeouts:
   takeoff_s: 15.0
