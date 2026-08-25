@@ -106,8 +106,21 @@ setsid bash -c "
 " >"$LOG_DIR/web_streamer.log" 2>&1 &
 STREAMER_PID=$!
 
+STREAM_PORT=5000
+IP_ADDRS=$(hostname -I 2>/dev/null)
+
 echo ""
 echo "All three running. PIDs: pipeline=$PIPELINE_PID node=$NODE_PID streamer=$STREAMER_PID"
+echo ""
+echo "📡 Vision Web Stream HUD:"
+if [[ -n "$IP_ADDRS" ]]; then
+  for ip in $IP_ADDRS; do
+    echo "  -> http://${ip}:${STREAM_PORT}"
+  done
+else
+  echo "  -> http://localhost:${STREAM_PORT}"
+fi
+echo ""
 echo "Logs: $LOG_DIR"
 echo "  tail -f $LOG_DIR/*.log"
 echo "Press Ctrl+C to stop everything cleanly."

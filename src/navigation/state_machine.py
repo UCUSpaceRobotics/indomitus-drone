@@ -62,7 +62,7 @@ class MissionController:
     """
 
     # Maximum horizontal distance from takeoff origin before emergency LAND (meters).
-    MAX_DISTANCE_FROM_ORIGIN_M = 4.2
+    MAX_DISTANCE_FROM_ORIGIN_M = 8.0
 
     # Consecutive valid vision detection frames required before transitioning from SEARCH to DESCEND (~100ms at 50Hz).
     SEARCH_CONFIRM_TICKS = 5
@@ -349,24 +349,26 @@ class MissionController:
             (0, -1), (0, -1), (1, 0), (1, 0),
         ]
 
-        # Ring 2: perimeter sweep of 5x5 outer band (16 new positions).
-        # Continues from (1,-1), traces the outer ring.
+        # Ring 2: clockwise perimeter sweep of 5x5 outer band (16 new positions).
+        # Continues from (1,-1): forward to (2,-1), then right along top,
+        # back down east side, left along bottom, forward up west side.
+        # Ends at (2,-2).
         ring2 = [
-            (1, 0), (0, -1),
+            (1, 0), (0, 1), (0, 1), (0, 1),
             (-1, 0), (-1, 0), (-1, 0), (-1, 0),
-            (0, 1), (0, 1), (0, 1), (0, 1),
+            (0, -1), (0, -1), (0, -1), (0, -1),
             (1, 0), (1, 0), (1, 0), (1, 0),
-            (0, -1), (0, -1),
         ]
 
-        # Ring 3: perimeter sweep of 7x7 outer band (24 new positions).
-        # Continues from (2,0), traces the outer ring.
+        # Ring 3: clockwise perimeter sweep of 7x7 outer band (24 new positions).
+        # Continues from (2,-2): forward to (3,-2), then right along top,
+        # back down east side, left along bottom, forward up west side.
+        # Ends at (3,-3).
         ring3 = [
-            (1, 0), (0, -1), (0, -1), (0, -1),
+            (1, 0), (0, 1), (0, 1), (0, 1), (0, 1), (0, 1),
             (-1, 0), (-1, 0), (-1, 0), (-1, 0), (-1, 0), (-1, 0),
-            (0, 1), (0, 1), (0, 1), (0, 1), (0, 1), (0, 1),
+            (0, -1), (0, -1), (0, -1), (0, -1), (0, -1), (0, -1),
             (1, 0), (1, 0), (1, 0), (1, 0), (1, 0), (1, 0),
-            (0, -1), (0, -1),
         ]
 
         return ring1 + ring2 + ring3
