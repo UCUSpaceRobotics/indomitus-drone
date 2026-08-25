@@ -101,9 +101,13 @@ class MissionController:
         # DESCEND state tracking.
         self._land_cmd_sent = False
 
-        self._search_phase = 0  # 0=hover, 1=hover forward, 2=searching
-        self._initiate_movement_time = time.time()  # Time when movement command was sent
-        self._search_attempts = 0  # Count of search attempts (hover forward cycles)
+        # SEARCH state: expanding-ring serpentine search pattern.
+        self._search_waypoints = self._generate_search_waypoints()
+        self._search_waypoint_index = 0
+        self._search_phase = 0  # 0=initial hover, 1=send waypoint, 2=wait for travel+dwell
+        self._waypoint_sent_time = 0.0
+        self._search_dwell_s = 3.0   # Seconds to hover at each waypoint for scanning
+        self._search_travel_s = 4.0  # Seconds allocated for 1m travel between waypoints
 
         print("[STATE] MissionController initialized - single mission run.")
         print(f"[STATE] Starting in {self.state.value}")
@@ -259,21 +263,21 @@ class MissionController:
                 self._transition_to(FlightState.SEARCH)
 
     def _update_search(self):
-        """SEARCH: Hover at altitude and look for the landing target marker.
+        """SEARCH: Fly an expanding-ring serpentine pattern to find the landing marker.
 
-        Current implementation: hover in place and wait for marker 102.
-        The 120-degree wide-angle lens at 2m altitude covers ~7x5m, which
-        should encompass the entire 3m search radius.
+        The drone systematically covers the 3m competition disc using 1m steps,
+        hovering at each grid point for a few seconds to let the camera detect
+        the ArUco marker without motion blur.
 
-        Requires SEARCH_CONFIRM_TICKS consecutive detection frames before
-        transitioning to DESCEND to reject transient visual glitches.
+        Pattern: center → 3×3 ring → 5×5 ring → 7×7 ring.
+        Body-frame relative moves (dx=forward, dy=right), 1m each.
 
-        TODO: Add expanding square spiral or grid sweep pattern if the
-        hover-and-look approach doesn't cover enough area.
+        The search is automatically preempted by _update_target() when the
+        landing marker is detected at any point.
         """
         elapsed = time.time() - self.state_entry_time
 
-        # Timeout - land wherever we are (counts as a failed attempt).
+        # Timeout — land wherever we are (counts as a failed attempt).
         if elapsed > self.timeout_search:
             print("[STATE] SEARCH TIMEOUT - no marker found. Commanding LAND.")
             self._send("set_mode", mode="LAND")
@@ -281,28 +285,91 @@ class MissionController:
             return
 
         if self._search_phase == 0:
-            # Phase 0: Hover in place (no movement commands).
-            if time.time() - self.state_entry_time >= 5.0:
-                print("[STATE] Hover in place for 5 seconds.")
+            # Phase 0: Initial hover at center for stabilization after climb.
+            if time.time() - self.state_entry_time >= self._search_dwell_s:
+                print("[STATE] Initial hover complete. Starting search pattern.")
+                print(f"[STATE] Search pattern: {len(self._search_waypoints)} waypoints across 3 rings.")
                 self._search_phase = 1
+
         elif self._search_phase == 1:
-            if self._search_attempts >= 2:
-                print("[STATE] Maximum search attempts reached. Commanding LAND.")
+            # Phase 1: Send next waypoint command.
+            if self._search_waypoint_index >= len(self._search_waypoints):
+                print("[STATE] Search pattern exhausted - no marker found. Commanding LAND.")
                 self._send("set_mode", mode="LAND")
-                self._transition_to(FlightState.DESCEND)
+                self._transition_to(FlightState.COMPLETE)
                 return
 
-            print("[STATE] Searching for landing target marker...")
-            self._send("move_local_pos", dx=1.0, dy=0.0, dz=0.0)  # Maintain hover.
-            print("[STATE] Hovering forward 1m, waiting for marker detection...")
-            self._initiate_movement_time = time.time()
-            self._search_attempts += 1
-            self._search_phase = 2  # Move to phase 2 to wait for hover completion.
+            dx, dy = self._search_waypoints[self._search_waypoint_index]
+            ring = self._get_search_ring()
+            wp = self._search_waypoint_index + 1
+            total = len(self._search_waypoints)
+            print(f"[STATE] Waypoint {wp}/{total} (Ring {ring}): dx={dx:+.0f}m, dy={dy:+.0f}m")
+
+            self._send("move_local_pos", dx=float(dx), dy=float(dy), dz=0.0)
+            self._waypoint_sent_time = time.time()
+            self._search_phase = 2
+
         elif self._search_phase == 2:
-            # Phase 2: Maintain hover and check for marker detection.
-            if time.time() - self._initiate_movement_time >= self.timeout_alignment:
-                print("[STATE] Hovering forward 1m complete, continuing search...")
-                self._search_phase = 1  # Loop back to maintain hover.
+            # Phase 2: Wait for travel + dwell, then advance to next waypoint.
+            if time.time() - self._waypoint_sent_time >= self._search_travel_s + self._search_dwell_s:
+                self._search_waypoint_index += 1
+                self._search_phase = 1
+
+    def _get_search_ring(self) -> int:
+        """Return current ring number (1, 2, or 3) based on waypoint index."""
+        if self._search_waypoint_index < 8:
+            return 1
+        if self._search_waypoint_index < 24:
+            return 2
+        return 3
+
+    @staticmethod
+    def _generate_search_waypoints():
+        """Pre-compute the expanding-ring serpentine as relative body-frame moves.
+
+        Each move is 1m in the body frame: dx=forward/back, dy=right/left.
+        The pattern covers a 7x7 grid (3m radius) in three expanding rings:
+
+            Ring 1:  3x3 inner grid  ( 8 moves,  9 positions incl. center)
+            Ring 2:  5x5 outer band  (16 moves, 16 new positions)
+            Ring 3:  7x7 outer band  (24 moves, 24 new positions)
+
+        Total: 48 moves, 49 unique scan positions.
+
+        Ring 1 serpentine (from center):
+            (0,0) → (1,0) → (1,1) → (0,1) → (-1,1) →
+            (-1,0) → (-1,-1) → (0,-1) → (1,-1)
+
+        Rings 2-3 trace the perimeter of each expanding square,
+        visiting only positions not yet covered by inner rings.
+        """
+        # Ring 1: serpentine covering 3x3 grid from center.
+        ring1 = [
+            (1, 0), (0, 1), (-1, 0), (-1, 0),
+            (0, -1), (0, -1), (1, 0), (1, 0),
+        ]
+
+        # Ring 2: perimeter sweep of 5x5 outer band (16 new positions).
+        # Continues from (1,-1), traces the outer ring.
+        ring2 = [
+            (1, 0), (0, -1),
+            (-1, 0), (-1, 0), (-1, 0), (-1, 0),
+            (0, 1), (0, 1), (0, 1), (0, 1),
+            (1, 0), (1, 0), (1, 0), (1, 0),
+            (0, -1), (0, -1),
+        ]
+
+        # Ring 3: perimeter sweep of 7x7 outer band (24 new positions).
+        # Continues from (2,0), traces the outer ring.
+        ring3 = [
+            (1, 0), (0, -1), (0, -1), (0, -1),
+            (-1, 0), (-1, 0), (-1, 0), (-1, 0), (-1, 0), (-1, 0),
+            (0, 1), (0, 1), (0, 1), (0, 1), (0, 1), (0, 1),
+            (1, 0), (1, 0), (1, 0), (1, 0), (1, 0), (1, 0),
+            (0, -1), (0, -1),
+        ]
+
+        return ring1 + ring2 + ring3
 
 
     def _update_target(self):

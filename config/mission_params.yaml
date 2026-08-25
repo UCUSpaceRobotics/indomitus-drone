@@ -38,7 +38,7 @@ ros2:
 
 timeouts:
   takeoff_s: 15.0
-  search_sweep_s: 60.0
+  search_sweep_s: 180.0
   alignment_s: 10.0
   landing_s: 15.0
 
