@@ -49,6 +49,7 @@ led:
   spi_device: 0
   num_leds: 7          # 7-bit WS2812 5050 RGB LED ring/module
   brightness: 128      # 0-255 brightness scale (~50% brightness)
+  blink_interval_s: 0.5 # Blink interval in seconds (500ms ON / 500ms OFF = 1 Hz)
   dma_channel: 10
   colors:
     manual: [0, 255, 0]      # Green for manual control / standby

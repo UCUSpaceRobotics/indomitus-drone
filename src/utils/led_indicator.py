@@ -4,13 +4,15 @@ Optimized for Raspberry Pi 5 using Hardware SPI (GPIO 10 / Physical Pin 19 - MOS
 Also supports legacy rpi_ws281x DMA and mock mode for local testing.
 
 Indicator States:
-  - GREEN: Manual control / standby
-  - RED: Autonomous execution
+  - GREEN (Blinking): Manual control / standby
+  - RED (Blinking): Autonomous execution
 """
 
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from typing import Tuple
 
 logger = logging.getLogger(__name__)
@@ -82,6 +84,8 @@ class SPIWS2812Driver:
 class LEDController:
     """Controls WS2812 5050 RGB LED hardware indicator for Raspberry Pi 5 & 4.
 
+    Emits blinking signals (Green for manual/standby, Red for autonomous execution).
+
     Args:
         config: Parsed 'led' dictionary from mission_params.yaml.
     """
@@ -95,16 +99,31 @@ class LEDController:
         self.spi_device = config.get("spi_device", 0)
         self.dma_channel = config.get("dma_channel", 10)
 
+        # Blink timing configuration (seconds per half-cycle: ON duration / OFF duration)
+        if "blink_rate_hz" in config:
+            self.blink_interval = 0.5 / max(0.1, float(config["blink_rate_hz"]))
+        elif "blink_interval_s" in config:
+            self.blink_interval = float(config["blink_interval_s"])
+        elif "blink_interval" in config:
+            self.blink_interval = float(config["blink_interval"])
+        else:
+            self.blink_interval = 0.5  # Default: 0.5s ON / 0.5s OFF (1 Hz)
+
         # Colors from config (R, G, B)
         colors_cfg = config.get("colors", {})
         self.color_manual: Tuple[int, int, int] = tuple(colors_cfg.get("manual", [0, 255, 0]))
         self.color_autonomous: Tuple[int, int, int] = tuple(colors_cfg.get("autonomous", [255, 0, 0]))
 
-        # State cache to avoid unnecessary hardware updates
+        # State tracking and threading
         self._current_color: Tuple[int, int, int] | None = None
         self._driver_type: str = "mock"
         self._spi_driver: SPIWS2812Driver | None = None
         self._ws281x_strip = None
+
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._thread: threading.Thread | None = None
 
         if not self.enabled:
             print("[LED] Disabled via configuration.")
@@ -116,13 +135,11 @@ class LEDController:
                 self._spi_driver = SPIWS2812Driver(self.spi_bus, self.spi_device)
                 self._driver_type = "spidev"
                 print(f"[LED] Initialized WS2812 via SPI (/dev/spidev{self.spi_bus}.{self.spi_device}) on GPIO {self.gpio_pin} (Pi 5 ready).")
-                self.set_manual_mode(force=True)
-                return
             except Exception as e:
                 print(f"[LED] SPI initialization failed ({e}). Check if SPI is enabled in raspi-config.")
 
         # Attempt 2: Legacy rpi_ws281x Driver (Raspberry Pi 3/4)
-        if HAS_RPI_WS281X:
+        if self._driver_type == "mock" and HAS_RPI_WS281X:
             try:
                 self._ws281x_strip = PixelStrip(
                     self.num_leds,
@@ -137,50 +154,106 @@ class LEDController:
                 self._ws281x_strip.begin()
                 self._driver_type = "rpi_ws281x"
                 print(f"[LED] Initialized WS2812 via rpi_ws281x on GPIO {self.gpio_pin}.")
-                self.set_manual_mode(force=True)
-                return
             except Exception as e:
                 print(f"[LED] rpi_ws281x initialization failed ({e}).")
 
         # Fallback: Mock Mode
-        print("[LED] Hardware LED drivers not available. Running in mock mode.")
+        if self._driver_type == "mock":
+            print("[LED] Hardware LED drivers not available. Running in mock mode.")
+
+        # Start blinking worker thread and set initial mode
+        self._start_thread()
         self.set_manual_mode(force=True)
 
-    def set_color(self, r: int, g: int, b: int, force: bool = False) -> None:
-        """Set all LEDs to the specified RGB color with brightness scaling.
+    def _start_thread(self) -> None:
+        """Start the background worker thread for blinking."""
+        if self._thread is None or not self._thread.is_alive():
+            self._stop_event.clear()
+            self._wake_event.clear()
+            self._thread = threading.Thread(
+                target=self._blink_loop,
+                daemon=True,
+                name="LEDIndicatorThread",
+            )
+            self._thread.start()
 
-        Uses state caching to prevent redundant SPI/DMA hardware transfers.
-        """
-        color_tuple = (r, g, b)
-        if not force and color_tuple == self._current_color:
-            return  # Color hasn't changed — skip hardware write for 0 CPU load.
-
-        self._current_color = color_tuple
-
-        # Scale brightness (0-255)
+    def _write_hardware(self, r: int, g: int, b: int) -> None:
+        """Send RGB data to physical hardware driver with brightness scaling."""
         scale = self.brightness / 255.0
         r_adj = int(r * scale)
         g_adj = int(g * scale)
         b_adj = int(b * scale)
 
-        if self._driver_type == "spidev" and self._spi_driver is not None:
-            self._spi_driver.write_pixels(self.num_leds, r_adj, g_adj, b_adj)
+        try:
+            if self._driver_type == "spidev" and self._spi_driver is not None:
+                self._spi_driver.write_pixels(self.num_leds, r_adj, g_adj, b_adj)
+            elif self._driver_type == "rpi_ws281x" and self._ws281x_strip is not None:
+                c = Color(r_adj, g_adj, b_adj)
+                for i in range(self.num_leds):
+                    self._ws281x_strip.setPixelColor(i, c)
+                self._ws281x_strip.show()
+        except Exception as e:
+            logger.debug(f"[LED] Hardware write failed: {e}")
 
-        elif self._driver_type == "rpi_ws281x" and self._ws281x_strip is not None:
-            c = Color(r_adj, g_adj, b_adj)
-            for i in range(self.num_leds):
-                self._ws281x_strip.setPixelColor(i, c)
-            self._ws281x_strip.show()
+    def _blink_loop(self) -> None:
+        """Background thread worker to blink LEDs with the current active color."""
+        while not self._stop_event.is_set():
+            with self._lock:
+                target_color = self._current_color
+
+            if target_color is None or target_color == (0, 0, 0):
+                # Turn off LEDs and wait until a new color is set or controller is stopped
+                self._write_hardware(0, 0, 0)
+                self._wake_event.wait(timeout=self.blink_interval)
+                self._wake_event.clear()
+                continue
+
+            r, g, b = target_color
+
+            # Phase 1: LEDs ON
+            self._write_hardware(r, g, b)
+            woken = self._wake_event.wait(timeout=self.blink_interval)
+            if self._stop_event.is_set():
+                break
+            if woken:
+                self._wake_event.clear()
+                continue
+
+            # Phase 2: LEDs OFF
+            self._write_hardware(0, 0, 0)
+            woken = self._wake_event.wait(timeout=self.blink_interval)
+            if self._stop_event.is_set():
+                break
+            if woken:
+                self._wake_event.clear()
+                continue
+
+    def set_color(self, r: int, g: int, b: int, force: bool = False) -> None:
+        """Set active blinking RGB color.
+
+        Uses state caching so calling set_color repeatedly with the same color
+        does not disrupt the active blinking phase.
+        """
+        if not self.enabled:
+            return
+
+        color_tuple = (r, g, b)
+        with self._lock:
+            if not force and color_tuple == self._current_color:
+                return  # Color hasn't changed — skip reset
+
+            self._current_color = color_tuple
 
         print(f"[LED] Color updated: RGB({r}, {g}, {b}) [{self._driver_type}]")
+        self._wake_event.set()
 
     def set_manual_mode(self, force: bool = False) -> None:
-        """Set LED indicator to Green (Manual control / Standby)."""
+        """Set LED indicator to Green blinking (Manual control / Standby)."""
         r, g, b = self.color_manual
         self.set_color(r, g, b, force=force)
 
     def set_autonomous_mode(self, force: bool = False) -> None:
-        """Set LED indicator to Red (Autonomy execution)."""
+        """Set LED indicator to Red blinking (Autonomous execution)."""
         r, g, b = self.color_autonomous
         self.set_color(r, g, b, force=force)
 
@@ -192,7 +265,20 @@ class LEDController:
             self.set_manual_mode()
 
     def close(self) -> None:
-        """Turn off all LEDs and release hardware resources."""
+        """Stop blinking, turn off all LEDs, and release hardware resources."""
+        if not self.enabled:
+            return
+
+        self._stop_event.set()
+        self._wake_event.set()
+
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+        with self._lock:
+            self._current_color = None
+
         if self._driver_type == "spidev" and self._spi_driver is not None:
             try:
                 self._spi_driver.write_pixels(self.num_leds, 0, 0, 0)
@@ -207,5 +293,5 @@ class LEDController:
             except Exception:
                 pass
 
-        self._current_color = None
         print("[LED] Shut down (LEDs off).")
+
