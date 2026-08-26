@@ -3,26 +3,31 @@
 ## 1. System Architecture & Hardware Stack
 
 ### 1.1 Frame & Propulsion
-* **Chassis:** F450 quadcopter frame equipped with landing gears.
-* **Custom Mounts:** Custom-manufactured holder integrated into the frame to securely mount the computer vision camera, optical flow sensor, and LiPo battery.
-* **Motors:** DJI 2212 920KV brushless motors.
-* **Propellers:** 1045R (10x4.5) propellers.
-* **Power Source:** 4S LiPo battery pack.
+* **Chassis:** F450 quadcopter frame equipped with landing gears. Total All-Up Weight (AUW) is ~2250 g.
+* **Custom Mounts:** Custom-manufactured holder integrated into the frame to securely mount the computer vision camera, optical flow sensor, and Li-Ion battery pack.
+* **Motors:** DJI 2212 920KV brushless motors (4x).
+* **Propellers:** 1045 (10x4.5) 2-blade CW & CCW propellers.
+* **Electronic Speed Controllers (ESC):** XXD 30A 2-4S ESC Brushless Motor Speed Controllers (4x).
+* **Power Source:** Li-Ion 4S2P 21700 Molicel P50B 10000 mAh battery pack (~14.4V nominal, ~144 Wh).
+* **Power Distribution & BECs:**
+  * APM/Pixhawk Power Module (current/voltage monitoring & Pixhawk power).
+  * Hobbywing 5A UBEC V2 (High Voltage Regulator step-down to 5V 5A for Raspberry Pi 5).
+  * Mini560-PRO DC-DC Step-Down converter (9V output for VTX).
 
 ### 1.2 Computing & Control
-* **Low-Level Flight Controller:** Pixhawk 6C running **ArduCopter** firmware (configured via Mission Planner). Manages real-time flight dynamics, motor PWM output, and low-level stabilization.
-* **Companion Computer:** Raspberry Pi 5 (16 GB RAM). Serves as the central processing unit for computer vision, high-level autonomous navigation, and state management. Powered via a 5V 5A UBEC.
+* **Low-Level Flight Controller:** Holybro Pixhawk 6C running **ArduCopter** firmware (configured via Mission Planner). Mounted on anti-vibration dampeners (12x rubber dampeners used across the stack). Manages real-time flight dynamics, motor PWM output, and low-level stabilization.
+* **Companion Computer:** Raspberry Pi 5 (16 GB RAM) with Kingston 64GB microSDXC card. Serves as the central processing unit for computer vision, high-level autonomous navigation, and state management. Powered via the 5V 5A Hobbywing UBEC.
 
 ### 1.3 Sensor Suite & Navigation
-* **Vision (Downward):** Arducam IMX708 12MP HDR 120° Wide Angle Camera Module for Raspberry Pi. Directly connected to the Pi to provide real-time imagery of the ground for marker and probe detection.
+* **Vision (Downward):** Arducam IMX708 12MP HDR 120° Wide Angle Camera Module for Raspberry Pi. Directly connected via MIPI CSI to the Pi to provide real-time imagery of the ground for marker and probe detection.
 * **Vision (Forward/Pilot):** Foxeer Cat 4 FPV camera. Dedicated purely for the pilot's forward view; it is **not** connected to the Raspberry Pi.
-* **Odometry:** Microair MTF-01 optical flow sensor (pointing downward) for stable, GPS-denied autonomous hovering and flight.
-* **Global Positioning:** Holybro M10 GPS and Compass module.
+* **Odometry:** MicoAir MTF-02P / MTF-02 optical flow & range sensor (pointing downward) for stable, GPS-denied autonomous hovering and flight.
+* **Global Positioning:** Holybro M10 GPS and IST8310 Compass module (115200 baud, 5Hz).
 
 ### 1.4 Communication & Video Routing
 * **RC Receiver:** RadioMaster RP1 V2 ExpressLRS 2.4GHz Nano Receiver.
-* **Telemetry Link:** 3DR Radio V5 Telemetry 433MHz module transmitting MAVLink data to the ground station.
-* **Video Transmitter (VTX):** Race Ranger VTX transmitting on the 5.8 GHz band, powered by a 9V mini DC-DC converter. *Note: The VTX is completely isolated from the Pixhawk, meaning there is no onboard OSD (On-Screen Display) overlay.*
+* **Telemetry Link:** 3DR Radio V5 Telemetry 433MHz module (100mW) transmitting MAVLink data to the ground station.
+* **Video Transmitter (VTX):** AKK Race Ranger VTX transmitting on 5.8 GHz band, powered via Mini560-PRO 9V converter, connected to a Rush Cherry II 5.8G RHCP SMA antenna (150mm). *Note: The VTX is completely isolated from the Pixhawk, meaning there is no onboard OSD overlay.*
 * **Video Switcher Logic:** A 3-channel video switcher toggles the VTX feed between two analog sources:
     1.  The forward-facing Foxeer Cat 4 FPV camera.
     2.  The composite video output from the Raspberry Pi.
@@ -68,9 +73,34 @@ During the preflight check, teams must present the implementation of the followi
 * **Grid Localization:** The area of competition is virtually divided into 1 x 1 m sectors. The probe detection system must point to locations of the probes using IDs of those sectors (e.g., sector A2 covers coordinates 0m; 0.5m to 0.5m; 1m).
 * **Custom Landing Platform (Optional):** Teams can earn additional points by preparing their own landing targets attachable to their rover (confined within a disc with a radius of 0.5 m). The platform does not have to use an ArUco marker. Teams can receive 15 points for preparing the platform and 15 points for each successful landing on it (up to a total of 45 points).
 
-## 4. Current Development Status & Required Implementations
+## 4. Flight Safety & Operational Limits Configuration
 
-The physical hardware stack is mapped out, and the core ArduCopter firmware is established. The following features are currently pending implementation:
+To strictly comply with ERC 2026 preflight safety regulations and prevent structural/cage damage during mission execution, the following ArduCopter flight dynamics, speed caps, and geofence parameters have been configured in Mission Planner:
+
+### 4.1 Geofencing & Altitude Ceiling
+* **Geofence System Enabled (`FENCE_ENABLE: 1`):** Active safety envelope monitoring.
+* **Fence Type (`FENCE_TYPE: 5`):** Combines Maximum Altitude Ceiling (`1`) and Inclusion Polygon (`4`).
+* **Maximum Altitude Ceiling (`FENCE_ALT_MAX: 3.0` m):** Hard ceiling set to 3.0 m (safely below the 4.0 m cage height).
+* **Breach Action (`FENCE_ACTION: 4` - Brake):** On boundary reach/breach, the drone immediately halts and hovers in place (Brake mode) rather than executing an unsafe indoor RTL.
+* **Warning Margin (`FENCE_MARGIN: 0.5` m):** Begins deceleration 0.5 m before the physical boundary.
+* **Inclusion Polygon Arena:** A $12 \times 12\text{ m}$ boundary uploaded to the flight controller, providing a 1-meter safety buffer around the $10 \times 10\text{ m}$ cage to eliminate false triggers while maintaining positive containment.
+
+### 4.2 Autonomous Flight Dynamics (Auto / Guided / Python MAVLink)
+* **Horizontal Speed (`WPNAV_SPEED: 80` cm/s):** Lateral speed capped at 0.8 m/s (~2.9 km/h) for clear camera imagery and minimal impact kinetic energy.
+* **Vertical Climb Speed (`WPNAV_SPEED_UP: 60` cm/s):** Ascent rate capped at 0.6 m/s.
+* **Vertical Descent Speed (`WPNAV_SPEED_DN: 40` cm/s):** Descent rate capped at 0.4 m/s to prevent Vortex Ring State (VRS) aerodynamic instability.
+* **Navigation Acceleration (`WPNAV_ACCEL: 60` cm/s²):** Smooth velocity ramps customized for the 2250 g All-Up Weight.
+
+### 4.3 Pilot Control & Touchdown Parameters
+* **Manual Tilt Angle Limit (`ANGLE_MAX: 1500` cdeg):** Hard cap of 15° maximum tilt angle in Stabilize/AltHold modes, preventing high-speed drift or uncontrolled acceleration under manual pilot override.
+* **Loiter Lateral Speed (`LOIT_SPEED: 80` cm/s):** Capped at 0.8 m/s for precise position holding with the MicoAir MTF-02P optical flow sensor.
+* **Loiter Acceleration & Braking:** `LOIT_ACC_MAX: 100` cm/s², `LOIT_BRK_ACCEL: 120` cm/s² for smooth, overshoot-free deceleration.
+* **Pilot Vertical Speeds:** Ascent `PILOT_SPEED_UP: 60` cm/s, Descent `PILOT_SPEED_DN: 40` cm/s.
+* **Final Touchdown Speed (`LAND_SPEED: 25` cm/s):** Soft touchdown velocity (0.25 m/s) to ensure stable, non-bouncing landings on ArUco landing markers and platforms.
+
+## 5. Current Development Status & Required Implementations
+
+The physical hardware stack is mapped out, safety and geofence parameters are configured, and the core ArduCopter firmware is established. The following features are currently pending implementation:
 
 1.  **State Indicator:** Integration of a physical light indicator to visually broadcast the drone's current mode (Autonomous vs. Manual).
 2.  **Computer Vision Pipeline:** 
@@ -81,5 +111,4 @@ The physical hardware stack is mapped out, and the core ArduCopter firmware is e
     *   Marker search algorithm (to sweep the 3m radius).
     *   Relative coordinate tracking.
     *   Precision landing control loops based on visual target alignment.
-    *   Implement geofence
     *   Configure MATLAB SIL simulation

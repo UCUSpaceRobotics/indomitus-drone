@@ -503,7 +503,7 @@ class PixhawkClient:
             f"[COMM] Command sent: VELOCITY [vx:{vx_m_s}, vy:{vy_m_s}, vz:{vz_m_s}] m/s"
         )
 
-    def land_on_target(
+    def send_landing_target(
         self,
         target: tuple[float, float, float],
         initiate_landing: bool = False,
@@ -569,6 +569,9 @@ class PixhawkClient:
             (1.0, 0.0, 0.0, 0.0),  # target orientation, unused
             mavutil.mavlink.LANDING_TARGET_TYPE_VISION_FIDUCIAL,
             1,  # position_valid
+        )
+        print(
+            f"[COMM] Command sent: LANDING TARGET [x:{x_m:.3f}, y:{y_m:.3f}, z:{z_m:.3f}]"
         )
 
         if initiate_landing:
