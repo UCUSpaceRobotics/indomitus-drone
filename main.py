@@ -55,7 +55,21 @@ def main():
     config = load_config()
 
     # ------------------------------------------------------------------
-    # 2. Initialize ROS 2
+    # 2. Startup standby delay (8 seconds — drone stationary)
+    # ------------------------------------------------------------------
+    start_delay_s = float(config.get("startup", {}).get("start_delay_s", 8.0))
+    if start_delay_s > 0:
+        print(f"[MAIN] Standby delay: waiting {start_delay_s:.0f}s before starting mission (no movement)...")
+        remaining = start_delay_s
+        while remaining > 0:
+            step = min(1.0, remaining)
+            print(f"[MAIN] Starting in {remaining:.0f}s...")
+            time.sleep(step)
+            remaining -= step
+        print("[MAIN] Standby delay complete. Initializing mission components.\n")
+
+    # ------------------------------------------------------------------
+    # 3. Initialize ROS 2
     # ------------------------------------------------------------------
     # Import rclpy here (not at top level) because it requires the ROS 2
     # environment to be sourced. Importing at top level would crash on
@@ -71,13 +85,13 @@ def main():
     print("[MAIN] ROS 2 initialized.")
 
     # ------------------------------------------------------------------
-    # 3. Create inter-process communication queues
+    # 4. Create inter-process communication queues
     # ------------------------------------------------------------------
     telemetry_queue = multiprocessing.Queue()
     command_queue = multiprocessing.Queue()
 
     # ------------------------------------------------------------------
-    # 4. Start the MAVLink communication process
+    # 5. Start the MAVLink communication process
     # ------------------------------------------------------------------
     from src.comm.mavlink_node import comm_process_loop
 
@@ -95,21 +109,21 @@ def main():
     print(f"[MAIN] Comm process started (PID: {comm_process.pid}).")
 
     # ------------------------------------------------------------------
-    # 5. Wait for Pixhawk initialization
+    # 6. Wait for Pixhawk initialization
     # ------------------------------------------------------------------
     init_delay = config["startup"]["pixhawk_init_delay_s"]
     print(f"[MAIN] Waiting {init_delay}s for Pixhawk heartbeat + EKF convergence...")
     time.sleep(init_delay)
 
     # ------------------------------------------------------------------
-    # 6. Initialize LED Indicator
+    # 7. Initialize LED Indicator
     # ------------------------------------------------------------------
     from src.utils.led_indicator import LEDController
 
     led = LEDController(config.get("led", {}))
 
     # ------------------------------------------------------------------
-    # 7. Create the VisionBridge (ROS 2 subscriber)
+    # 8. Create the VisionBridge (ROS 2 subscriber)
     # ------------------------------------------------------------------
     from src.ros_bridge.vision_subscriber import VisionBridge
 
@@ -120,7 +134,7 @@ def main():
     print("[MAIN] VisionBridge created — subscribed to vision topic.")
 
     # ------------------------------------------------------------------
-    # 8. Create the MissionController (state machine)
+    # 9. Create the MissionController (state machine)
     # ------------------------------------------------------------------
     from src.navigation.state_machine import MissionController, FlightState
 
@@ -134,7 +148,7 @@ def main():
     print("[MAIN] MissionController created — state machine ready.")
 
     # ------------------------------------------------------------------
-    # 9. Main loop
+    # 10. Main loop
     # ------------------------------------------------------------------
     print()
     print("[MAIN] Entering main loop (50 Hz).")
@@ -154,7 +168,7 @@ def main():
         time.sleep(1.0)
 
     # ------------------------------------------------------------------
-    # 10. Shutdown
+    # 11. Shutdown
     # ------------------------------------------------------------------
     print("\n[MAIN] Shutting down...")
 

@@ -1,6 +1,7 @@
 # ERC 2026 Droning Sub-Task — Mission Parameters
 
 startup:
+  start_delay_s: 8.0           # Initial standby delay before starting mission (no drone movement)
   pixhawk_init_delay_s: 6.0    # Wait for Pixhawk heartbeat + EKF convergence after boot
 
 flight:
