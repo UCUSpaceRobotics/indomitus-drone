@@ -109,6 +109,15 @@ class MissionController:
         self._search_dwell_s = 3.0   # Seconds to hover at each waypoint for scanning
         self._search_travel_s = 4.0  # Seconds allocated for 1m travel between waypoints
 
+        # Centering: fly above detected marker before initiating landing.
+        self._centering_active = False
+        self._centering_start_time = 0.0
+        self._centered_ticks = 0           # Consecutive frames with small offset
+        self._last_centering_move_time = 0.0
+        self.CENTERING_THRESHOLD_M = 0.3   # Max offset to consider "centered"
+        self.CENTERING_CONFIRM_TICKS = 10  # Frames of being centered before landing
+        self.CENTERING_TIMEOUT_S = 10.0    # Max seconds to spend centering
+
         print("[STATE] MissionController initialized - single mission run.")
         print(f"[STATE] Starting in {self.state.value}")
         self._update_led_indicator()
@@ -275,6 +284,11 @@ class MissionController:
         The search is automatically preempted by _update_target() when the
         landing marker is detected at any point.
         """
+        # Pause search pattern while centering on a detected marker.
+        # Waypoint index is preserved — pattern resumes if centering fails.
+        if self._centering_active:
+            return
+
         elapsed = time.time() - self.state_entry_time
 
         # Timeout — land wherever we are (counts as a failed attempt).
@@ -375,25 +389,93 @@ class MissionController:
 
 
     def _update_target(self):
-        """Check for landing target detection and handle transition to DESCEND."""
+        """Check for landing target detection, center above it, then land.
 
-        # Check vision for landing target.
+        Runs every tick regardless of state. Three phases:
+            1. Detection: count consecutive frames to confirm marker (debounce).
+            2. Centering: fly toward the marker until directly above it.
+            3. Landing: initiate precision landing once centered.
+
+        If the marker is lost during centering, reset and resume the search
+        pattern from the current waypoint.
+        """
         target = self.vision.get_latest_target()
+
         if target is not None and target["marker_id"] == self.landing_target_id:
             self._search_detect_ticks += 1
-            self._send("send_landing_target", target=[target["x_offset_m"], target["y_offset_m"], self._get_altitude()])
-            # print(f"[STATE] Landing target detected at offset ({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m")
-            if self.state != FlightState.DESCEND and self._search_detect_ticks >= self.SEARCH_CONFIRM_TICKS:
-                print(
-                    f"[STATE] Landing target CONFIRMED ({self._search_detect_ticks} frames) at offset "
-                    f"({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m"
-                )
-                print("[STATE] Transitioning to DESCEND.")
-                print("[STATE] Commanding LAND.")
-                self._send("land_on_target", target=[target["x_offset_m"], target["y_offset_m"], self._get_altitude()], initiate_landing=True)
-                self._transition_to(FlightState.DESCEND)
+            x_off = target["x_offset_m"]
+            y_off = target["y_offset_m"]
+            alt = self._get_altitude()
+
+            # Always feed target position to ArduPilot (used during DESCEND).
+            self._send("send_landing_target", target=[x_off, y_off, alt])
+
+            # Already descending — just keep feeding updates, nothing else to do.
+            if self.state == FlightState.DESCEND:
+                return
+
+            # Not enough consecutive frames yet — wait for confirmation.
+            if self._search_detect_ticks < self.SEARCH_CONFIRM_TICKS:
+                return
+
+            # --- Marker confirmed — center above it before landing ---
+
+            offset_dist = math.sqrt(x_off ** 2 + y_off ** 2)
+
+            if offset_dist < self.CENTERING_THRESHOLD_M:
+                # Close enough — count centered frames.
+                self._centered_ticks += 1
+                if self._centered_ticks >= self.CENTERING_CONFIRM_TICKS:
+                    # Stable and centered — initiate landing.
+                    print(
+                        f"[STATE] Centered above target ({offset_dist:.2f}m offset, "
+                        f"{self._centered_ticks} frames). Initiating landing."
+                    )
+                    self._send(
+                        "land_on_target",
+                        target=[x_off, y_off, alt],
+                        initiate_landing=True,
+                    )
+                    self._centering_active = False
+                    self._transition_to(FlightState.DESCEND)
+            else:
+                # Still too far — enter/continue centering mode.
+                self._centered_ticks = 0
+
+                if not self._centering_active:
+                    print(
+                        f"[STATE] Marker confirmed at offset ({x_off:+.2f}, {y_off:+.2f})m "
+                        f"({offset_dist:.2f}m). Centering above target..."
+                    )
+                    self._centering_active = True
+                    self._centering_start_time = time.time()
+                    self._last_centering_move_time = 0.0
+
+                # Send corrective move every 2 seconds (let drone settle between corrections).
+                now = time.time()
+                if now - self._last_centering_move_time >= 2.0:
+                    self._log_throttled(
+                        f"Centering: offset ({x_off:+.2f}, {y_off:+.2f})m → "
+                        f"moving dx={x_off:+.2f}, dy={y_off:+.2f}",
+                        interval=2.0,
+                    )
+                    self._send("move_local_pos", dx=x_off, dy=y_off, dz=0.0)
+                    self._last_centering_move_time = now
+
+                # Centering timeout — give up and resume search.
+                if now - self._centering_start_time > self.CENTERING_TIMEOUT_S:
+                    print("[STATE] Centering timeout — resuming search pattern.")
+                    self._centering_active = False
+                    self._search_detect_ticks = 0
+                    self._centered_ticks = 0
         else:
+            # Marker not visible this frame.
+            if self._centering_active:
+                print("[STATE] Marker lost during centering — resuming search pattern.")
+                self._centering_active = False
             self._search_detect_ticks = 0
+            self._centered_ticks = 0
+
 
     def _update_descend(self):
         """DESCEND: Precision landing using ArduPilot's LANDING_TARGET system.
@@ -474,6 +556,8 @@ class MissionController:
         self._takeoff_cmd_time = 0.0
         self._search_detect_ticks = 0
         self._land_cmd_sent = False
+        self._centering_active = False
+        self._centered_ticks = 0
 
         print(f"[STATE] {old} -> {new_state.value}")
 
