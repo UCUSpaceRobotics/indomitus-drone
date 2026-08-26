@@ -65,7 +65,7 @@ class MissionController:
     MAX_DISTANCE_FROM_ORIGIN_M = 8.0
 
     # Consecutive valid vision detection frames required before transitioning from SEARCH to DESCEND (~100ms at 50Hz).
-    SEARCH_CONFIRM_TICKS = 5
+    SEARCH_CONFIRM_TICKS = 20
 
     def __init__(self, command_queue, telemetry_queue, vision_bridge, config: dict, led_indicator=None):
         self.cmd_q = command_queue
@@ -114,9 +114,11 @@ class MissionController:
         self._centering_start_time = 0.0
         self._centered_ticks = 0           # Consecutive frames with small offset
         self._last_centering_move_time = 0.0
-        self.CENTERING_THRESHOLD_M = 0.3   # Max offset to consider "centered"
+        self.CENTERING_THRESHOLD_M = 0.2   # Max offset to consider "centered"
         self.CENTERING_CONFIRM_TICKS = 10  # Frames of being centered before landing
         self.CENTERING_TIMEOUT_S = 10.0    # Max seconds to spend centering
+
+        self.is_target_inisialized = False  # Flag to check if the target has been initialized
 
         print("[STATE] MissionController initialized - single mission run.")
         print(f"[STATE] Starting in {self.state.value}")
@@ -406,9 +408,17 @@ class MissionController:
             x_off = target["x_offset_m"]
             y_off = target["y_offset_m"]
             alt = self._get_altitude()
+            offset_dist = math.sqrt(x_off ** 2 + y_off ** 2)
 
-            # Always feed target position to ArduPilot (used during DESCEND).
-            self._send("send_landing_target", target=[x_off, y_off, alt])
+            if self.is_target_inisialized and offset_dist < self.CENTERING_THRESHOLD_M:
+                self._log_throttled(
+                    f"Marker detected at offset ({x_off:+.2f}, {y_off:+.2f})m "
+                    f"({offset_dist:.2f}m). Within centering threshold.",
+                    interval=1.0,
+                )
+            else:
+                # Always feed target position to ArduPilot (used during DESCEND).
+                self._send("send_landing_target", target=[x_off, y_off, alt])
 
             # Already descending — just keep feeding updates, nothing else to do.
             if self.state == FlightState.DESCEND:
@@ -419,55 +429,8 @@ class MissionController:
                 return
 
             # --- Marker confirmed — center above it before landing ---
+            self.is_target_inisialized = True
 
-            offset_dist = math.sqrt(x_off ** 2 + y_off ** 2)
-
-            if offset_dist < self.CENTERING_THRESHOLD_M:
-                # Close enough — count centered frames.
-                self._centered_ticks += 1
-                if self._centered_ticks >= self.CENTERING_CONFIRM_TICKS:
-                    # Stable and centered — initiate landing.
-                    print(
-                        f"[STATE] Centered above target ({offset_dist:.2f}m offset, "
-                        f"{self._centered_ticks} frames). Initiating landing."
-                    )
-                    self._send(
-                        "land_on_target",
-                        target=[x_off, y_off, alt],
-                        initiate_landing=True,
-                    )
-                    self._centering_active = False
-                    self._transition_to(FlightState.DESCEND)
-            else:
-                # Still too far — enter/continue centering mode.
-                self._centered_ticks = 0
-
-                if not self._centering_active:
-                    print(
-                        f"[STATE] Marker confirmed at offset ({x_off:+.2f}, {y_off:+.2f})m "
-                        f"({offset_dist:.2f}m). Centering above target..."
-                    )
-                    self._centering_active = True
-                    self._centering_start_time = time.time()
-                    self._last_centering_move_time = 0.0
-
-                # Send corrective move every 2 seconds (let drone settle between corrections).
-                now = time.time()
-                if now - self._last_centering_move_time >= 2.0:
-                    self._log_throttled(
-                        f"Centering: offset ({x_off:+.2f}, {y_off:+.2f})m → "
-                        f"moving dx={x_off:+.2f}, dy={y_off:+.2f}",
-                        interval=2.0,
-                    )
-                    self._send("move_local_pos", dx=x_off, dy=y_off, dz=0.0)
-                    self._last_centering_move_time = now
-
-                # Centering timeout — give up and resume search.
-                if now - self._centering_start_time > self.CENTERING_TIMEOUT_S:
-                    print("[STATE] Centering timeout — resuming search pattern.")
-                    self._centering_active = False
-                    self._search_detect_ticks = 0
-                    self._centered_ticks = 0
         else:
             # Marker not visible this frame.
             if self._centering_active:

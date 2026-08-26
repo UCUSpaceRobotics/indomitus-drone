@@ -163,7 +163,7 @@ def main():
         print("\n[MAIN] === EMERGENCY STOP ===")
         print("[MAIN] Sending LAND command to Pixhawk...")
         from src.comm.mavlink_node import create_command
-        command_queue.put(create_command("set_mode", mode="LAND"))
+        command_queue.put(create_command("land"))
         # Give the comm process a moment to send the command.
         time.sleep(1.0)
 
