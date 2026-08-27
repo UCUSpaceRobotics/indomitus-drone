@@ -133,12 +133,18 @@ class MissionController:
         the main loop calls. Internally it:
             1. Refreshes telemetry from the comm process queue.
             2. Processes pending ROS 2 vision messages.
-            3. Checks geofence safety.
-            4. Dispatches to the handler for the current state.
-            5. Updates the LED indicator state.
+            3. Checks for external manual override or autopilot failsafe.
+            4. Checks geofence safety.
+            5. Dispatches to the handler for the current state.
+            6. Updates precision landing target stream.
+            7. Updates the LED indicator state.
         """
         self._refresh_telemetry()
         self.vision.spin_once()
+
+        # Check if pilot intervened on RC or Pixhawk entered failsafe (e.g. Battery Failsafe LAND/RTL).
+        if self._check_external_override_or_failsafe():
+            return
 
         # Safety: emergency land if drone drifts too far from origin.
         if self._check_geofence():
@@ -160,6 +166,51 @@ class MissionController:
     # ==================================================================
     # Safety
     # ==================================================================
+
+    def _check_external_override_or_failsafe(self) -> bool:
+        """Abort mission if pilot takes manual control or Pixhawk enters failsafe.
+
+        Returns True if an override/failsafe occurred and state was forced to COMPLETE.
+        """
+        if not self.telem or self.state in (FlightState.IDLE, FlightState.COMPLETE):
+            return False
+
+        mode = self.telem.get("mode", "UNKNOWN")
+
+        # 1. BREAK is always an immediate abort in an enclosed competition area.
+        if mode == "BREAK":
+            print(f"[STATE] [FAILSAFE/OVERRIDE] BREAK mode detected. Aborting mission.")
+            self._transition_to(FlightState.COMPLETE)
+            return True
+
+        # 2. In SEARCH: Flight mode must be GUIDED.
+        if self.state == FlightState.SEARCH and mode != "GUIDED":
+            print(
+                f"[STATE] [OVERRIDE] Mode changed from GUIDED to {mode} during SEARCH. "
+                "Aborting mission."
+            )
+            self._transition_to(FlightState.COMPLETE)
+            return True
+
+        # 3. In TAKEOFF (climbing phase, _takeoff_phase >= 3): Flight mode must be GUIDED.
+        if self.state == FlightState.TAKEOFF and self._takeoff_phase >= 3 and mode != "GUIDED":
+            print(
+                f"[STATE] [OVERRIDE] Mode changed to {mode} during takeoff climb. "
+                "Aborting mission."
+            )
+            self._transition_to(FlightState.COMPLETE)
+            return True
+
+        # 4. In DESCEND: Pilot manual takeover (switching out of GUIDED/LAND).
+        if self.state == FlightState.DESCEND and mode not in ("GUIDED", "LAND"):
+            print(
+                f"[STATE] [OVERRIDE] Pilot took manual control ({mode}) during descent. "
+                "Aborting mission."
+            )
+            self._transition_to(FlightState.COMPLETE)
+            return True
+
+        return False
 
     def _check_geofence(self) -> bool:
         """Emergency LAND if the drone drifts too far from the takeoff origin.
@@ -191,7 +242,7 @@ class MissionController:
     # ==================================================================
 
     def _update_idle(self):
-        """IDLE: Wait for telemetry connection and EKF health before takeoff."""
+        """IDLE: Wait for telemetry connection, EKF health, and stationary origin before takeoff."""
         if not self.telem:
             return  # No telemetry received yet.
 
@@ -206,8 +257,18 @@ class MissionController:
             self._log_throttled("Waiting for EKF to converge...")
             return
 
-        # Both conditions met - clear to take off.
-        print("[STATE] Pixhawk connected, EKF healthy. Starting mission.")
+        # Verify initial local position is not drifting before takeoff
+        x = self.telem.get("pos_x_m", 0.0)
+        y = self.telem.get("pos_y_m", 0.0)
+        origin_dist = math.sqrt(x ** 2 + y ** 2)
+        if origin_dist > 1.0:
+            self._log_throttled(
+                f"Waiting for origin to settle (current offset: {origin_dist:.2f}m > 1.0m)..."
+            )
+            return
+
+        # All conditions met - clear to take off.
+        print("[STATE] Pixhawk connected, EKF healthy, origin stable. Starting mission.")
         self._transition_to(FlightState.TAKEOFF)
 
     def _update_takeoff(self):
