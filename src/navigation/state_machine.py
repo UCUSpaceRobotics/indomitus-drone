@@ -193,7 +193,7 @@ class MissionController:
             return True
 
         # 3. In TAKEOFF (climbing phase, _takeoff_phase >= 3): Flight mode must be GUIDED.
-        if self.state == FlightState.TAKEOFF and self._takeoff_phase >= 3 and mode != "GUIDED":
+        if self.state == FlightState.TAKEOFF and self._takeoff_phase >= 4 and mode != "GUIDED":
             print(
                 f"[STATE] [OVERRIDE] Mode changed to {mode} during takeoff climb. "
                 "Aborting mission."
