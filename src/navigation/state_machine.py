@@ -112,6 +112,11 @@ class MissionController:
         # Target tracking: timestamp of last marker sighting (used for descent abort).
         self._last_target_seen_time = 0.0
 
+        # Landing target message rate limiting & cutoff during descent.
+        self._last_landing_target_send_time = 0.0
+        self.LANDING_TARGET_SEND_INTERVAL_S = 0.2  # 5 Hz during descent (200ms)
+        self.LANDING_TARGET_MIN_ALT_M = 0.5        # Stop sending corrections below 0.5m
+
         print("[STATE] MissionController initialized - single mission run.")
         print(f"[STATE] Starting in {self.state.value}")
         self._update_led_indicator()
@@ -445,8 +450,13 @@ class MissionController:
         (SEARCH_CONFIRM_TICKS consecutive frames), immediately initiates
         precision landing and transitions to DESCEND.
 
-        Also tracks _last_target_seen_time so _update_descend() can abort
-        if the marker is lost for too long during descent.
+        During DESCEND:
+            - Throttles LANDING_TARGET messages to 5 Hz (every 200ms) to prevent
+              over-correcting and oscillation.
+            - Ceases sending LANDING_TARGET messages below 0.5m altitude so the
+              drone commits to touchdown without late erratic corrections.
+            - Tracks _last_target_seen_time so _update_descend() can abort if
+              marker is lost at higher altitude (>1.0m).
         """
         target = self.vision.get_latest_target()
 
@@ -457,8 +467,18 @@ class MissionController:
             y_off = target["y_offset_m"]
             alt = self._get_altitude()
 
-            # Always feed target position to ArduPilot.
-            self._send("send_landing_target", target=[x_off, y_off, alt])
+            now = time.time()
+            if self.state == FlightState.DESCEND:
+                # During DESCEND: stop corrections below cutoff altitude (commit to touchdown).
+                # Above cutoff: throttle updates to 5 Hz to prevent rapid oscillation.
+                if alt > self.LANDING_TARGET_MIN_ALT_M:
+                    if now - self._last_landing_target_send_time >= self.LANDING_TARGET_SEND_INTERVAL_S:
+                        self._send("send_landing_target", target=[x_off, y_off, alt])
+                        self._last_landing_target_send_time = now
+            else:
+                # During SEARCH: feed target position without throttling for confirmation.
+                self._send("send_landing_target", target=[x_off, y_off, alt])
+                self._last_landing_target_send_time = now
 
             if self.state != FlightState.DESCEND and self._search_detect_ticks >= self.SEARCH_CONFIRM_TICKS:
                 print(
@@ -468,6 +488,7 @@ class MissionController:
                 print("[STATE] Transitioning to DESCEND.")
                 print("[STATE] Commanding LAND.")
                 self._send("land_on_target", target=[x_off, y_off, alt], initiate_landing=True)
+                self._last_landing_target_send_time = now
                 self._transition_to(FlightState.DESCEND)
         else:
             self._search_detect_ticks = 0
@@ -495,9 +516,11 @@ class MissionController:
             self._transition_to(FlightState.COMPLETE)
             return
 
-        # Marker-lost abort: if no detection for 3s (after 2s grace period),
-        # give up on this landing attempt and resume searching.
-        if elapsed > 2.0 and self._last_target_seen_time > 0.0:
+        # Marker-lost abort: if no detection for 3s (after 2s grace period)
+        # AND still above 1m, give up on this attempt and resume searching.
+        # Below 1m the marker naturally leaves the camera FoV, so just let
+        # ArduPilot finish the landing at the last known position.
+        if elapsed > 2.0 and self._last_target_seen_time > 0.0 and self._get_altitude() > 1.0:
             time_since_marker = time.time() - self._last_target_seen_time
             if time_since_marker > 3.0:
                 print(
@@ -564,6 +587,7 @@ class MissionController:
         self._takeoff_cmd_time = 0.0
         self._search_detect_ticks = 0
         self._land_cmd_sent = False
+        self._last_landing_target_send_time = 0.0
 
         print(f"[STATE] {old} -> {new_state.value}")
 
