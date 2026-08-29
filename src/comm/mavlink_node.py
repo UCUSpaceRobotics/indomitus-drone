@@ -102,7 +102,7 @@ def comm_process_loop(
                     continue  # Skip execution, go to next command
 
                 # --- 2. Command Dispatcher ---
-                dispatch_command(client, cmd)
+                dispatch_command(client, cmd, telem=current_telemetry)
 
             # ---------------------------------------------------------
             # D. CPU RELIEF (Yield execution)
@@ -117,8 +117,19 @@ def comm_process_loop(
             time.sleep(1)  # Prevent log spamming on failure
 
 
-def dispatch_command(client, cmd):
+def dispatch_command(client, cmd, telem):
     action = cmd.get("action")
+
+    if telem.get("armed", False) is False and action not in ["arm", "set_mode"]:
+        raise ValueError(f"[COMM_NODE] ERROR: Ignoring command '{action}' because drone is not armed.")
+
+    if telem.get("mode") != "GUIDED" and action not in ["arm", "set_mode"]:
+        if telem.get("mode") is None:
+            raise ValueError(f"[COMM_NODE] ERROR: Ignoring command '{action}' because drone mode is unknown.")
+        if telem.get("mode") == "LAND" and action in ["send_landing_target", "land_on_target"]:
+            ... # Ignore and proceed with landing commands even if in LAND mode
+        else:
+            raise ValueError(f"[COMM_NODE] ERROR: Ignoring command '{action}' because drone is not in GUIDED mode.")
 
     if action == "arm":
         client.arm(state=cmd.get("state", True))
