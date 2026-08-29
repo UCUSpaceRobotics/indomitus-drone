@@ -57,3 +57,4 @@ logs/
 
 # Calibration images (raw captures — the .npz result IS tracked)
 calibration_images/
+matlab/slprj
