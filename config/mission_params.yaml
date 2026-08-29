@@ -1,6 +1,7 @@
 # ERC 2026 Droning Sub-Task — Mission Parameters
 
 startup:
+  start_delay_s: 8.0           # Initial standby delay before starting mission (no drone movement)
   pixhawk_init_delay_s: 6.0    # Wait for Pixhawk heartbeat + EKF convergence after boot
 
 flight:
@@ -34,11 +35,11 @@ serial:
 
 ros2:
   vision_topic: /erc/vision_targets
-  domain_id: 42
+  domain_id: 27
 
 timeouts:
   takeoff_s: 15.0
-  search_sweep_s: 60.0
+  search_sweep_s: 320.0
   alignment_s: 10.0
   landing_s: 15.0
 
@@ -49,6 +50,7 @@ led:
   spi_device: 0
   num_leds: 7          # 7-bit WS2812 5050 RGB LED ring/module
   brightness: 128      # 0-255 brightness scale (~50% brightness)
+  blink_interval_s: 0.5 # Blink interval in seconds (500ms ON / 500ms OFF = 1 Hz)
   dma_channel: 10
   colors:
     manual: [0, 255, 0]      # Green for manual control / standby

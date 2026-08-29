@@ -62,7 +62,7 @@ class MissionController:
     """
 
     # Maximum horizontal distance from takeoff origin before emergency LAND (meters).
-    MAX_DISTANCE_FROM_ORIGIN_M = 4.2
+    MAX_DISTANCE_FROM_ORIGIN_M = 8.0
 
     # Consecutive valid vision detection frames required before transitioning from SEARCH to DESCEND (~100ms at 50Hz).
     SEARCH_CONFIRM_TICKS = 5
@@ -101,9 +101,21 @@ class MissionController:
         # DESCEND state tracking.
         self._land_cmd_sent = False
 
-        self._search_phase = 0  # 0=hover, 1=hover forward, 2=searching
-        self._initiate_movement_time = time.time()  # Time when movement command was sent
-        self._search_attempts = 0  # Count of search attempts (hover forward cycles)
+        # SEARCH state: expanding-ring serpentine search pattern.
+        self._search_waypoints = self._generate_search_waypoints()
+        self._search_waypoint_index = 0
+        self._search_phase = 0  # 0=initial hover, 1=send waypoint, 2=wait for travel+dwell
+        self._waypoint_sent_time = 0.0
+        self._search_dwell_s = 3.0   # Seconds to hover at each waypoint for scanning
+        self._search_travel_s = 4.0  # Seconds allocated for 1m travel between waypoints
+
+        # Target tracking: timestamp of last marker sighting (used for descent abort).
+        self._last_target_seen_time = 0.0
+
+        # Landing target message rate limiting & cutoff during descent.
+        self._last_landing_target_send_time = 0.0
+        self.LANDING_TARGET_SEND_INTERVAL_S = 0.2  # 5 Hz during descent (200ms)
+        self.LANDING_TARGET_MIN_ALT_M = 0.5        # Stop sending corrections below 0.5m
 
         print("[STATE] MissionController initialized - single mission run.")
         print(f"[STATE] Starting in {self.state.value}")
@@ -120,12 +132,18 @@ class MissionController:
         the main loop calls. Internally it:
             1. Refreshes telemetry from the comm process queue.
             2. Processes pending ROS 2 vision messages.
-            3. Checks geofence safety.
-            4. Dispatches to the handler for the current state.
-            5. Updates the LED indicator state.
+            3. Checks for external manual override or autopilot failsafe.
+            4. Checks geofence safety.
+            5. Dispatches to the handler for the current state.
+            6. Updates precision landing target stream.
+            7. Updates the LED indicator state.
         """
         self._refresh_telemetry()
         self.vision.spin_once()
+
+        # Check if pilot intervened on RC or Pixhawk entered failsafe (e.g. Battery Failsafe LAND/RTL).
+        if self._check_external_override_or_failsafe():
+            return
 
         # Safety: emergency land if drone drifts too far from origin.
         if self._check_geofence():
@@ -147,6 +165,51 @@ class MissionController:
     # ==================================================================
     # Safety
     # ==================================================================
+
+    def _check_external_override_or_failsafe(self) -> bool:
+        """Abort mission if pilot takes manual control or Pixhawk enters failsafe.
+
+        Returns True if an override/failsafe occurred and state was forced to COMPLETE.
+        """
+        if not self.telem or self.state in (FlightState.IDLE, FlightState.COMPLETE):
+            return False
+
+        mode = self.telem.get("mode", "UNKNOWN")
+
+        # 1. BREAK is always an immediate abort in an enclosed competition area.
+        if mode == "BREAK":
+            print(f"[STATE] [FAILSAFE/OVERRIDE] BREAK mode detected. Aborting mission.")
+            self._transition_to(FlightState.COMPLETE)
+            return True
+
+        # 2. In SEARCH: Flight mode must be GUIDED.
+        if self.state == FlightState.SEARCH and mode != "GUIDED":
+            print(
+                f"[STATE] [OVERRIDE] Mode changed from GUIDED to {mode} during SEARCH. "
+                "Aborting mission."
+            )
+            self._transition_to(FlightState.COMPLETE)
+            return True
+
+        # 3. In TAKEOFF (climbing phase, _takeoff_phase >= 3): Flight mode must be GUIDED.
+        if self.state == FlightState.TAKEOFF and self._takeoff_phase >= 4 and mode != "GUIDED":
+            print(
+                f"[STATE] [OVERRIDE] Mode changed to {mode} during takeoff climb. "
+                "Aborting mission."
+            )
+            self._transition_to(FlightState.COMPLETE)
+            return True
+
+        # 4. In DESCEND: Pilot manual takeover (switching out of GUIDED/LAND).
+        if self.state == FlightState.DESCEND and mode not in ("GUIDED", "LAND"):
+            print(
+                f"[STATE] [OVERRIDE] Pilot took manual control ({mode}) during descent. "
+                "Aborting mission."
+            )
+            self._transition_to(FlightState.COMPLETE)
+            return True
+
+        return False
 
     def _check_geofence(self) -> bool:
         """Emergency LAND if the drone drifts too far from the takeoff origin.
@@ -178,7 +241,7 @@ class MissionController:
     # ==================================================================
 
     def _update_idle(self):
-        """IDLE: Wait for telemetry connection and EKF health before takeoff."""
+        """IDLE: Wait for telemetry connection, EKF health, and stationary origin before takeoff."""
         if not self.telem:
             return  # No telemetry received yet.
 
@@ -193,8 +256,18 @@ class MissionController:
             self._log_throttled("Waiting for EKF to converge...")
             return
 
-        # Both conditions met - clear to take off.
-        print("[STATE] Pixhawk connected, EKF healthy. Starting mission.")
+        # Verify initial local position is not drifting before takeoff
+        x = self.telem.get("pos_x_m", 0.0)
+        y = self.telem.get("pos_y_m", 0.0)
+        origin_dist = math.sqrt(x ** 2 + y ** 2)
+        if origin_dist > 1.0:
+            self._log_throttled(
+                f"Waiting for origin to settle (current offset: {origin_dist:.2f}m > 1.0m)..."
+            )
+            return
+
+        # All conditions met - clear to take off.
+        print("[STATE] Pixhawk connected, EKF healthy, origin stable. Starting mission.")
         self._transition_to(FlightState.TAKEOFF)
 
     def _update_takeoff(self):
@@ -259,21 +332,21 @@ class MissionController:
                 self._transition_to(FlightState.SEARCH)
 
     def _update_search(self):
-        """SEARCH: Hover at altitude and look for the landing target marker.
+        """SEARCH: Fly an expanding-ring serpentine pattern to find the landing marker.
 
-        Current implementation: hover in place and wait for marker 102.
-        The 120-degree wide-angle lens at 2m altitude covers ~7x5m, which
-        should encompass the entire 3m search radius.
+        The drone systematically covers the 3m competition disc using 1m steps,
+        hovering at each grid point for a few seconds to let the camera detect
+        the ArUco marker without motion blur.
 
-        Requires SEARCH_CONFIRM_TICKS consecutive detection frames before
-        transitioning to DESCEND to reject transient visual glitches.
+        Pattern: center → 3×3 ring → 5×5 ring → 7×7 ring.
+        Body-frame relative moves (dx=forward, dy=right), 1m each.
 
-        TODO: Add expanding square spiral or grid sweep pattern if the
-        hover-and-look approach doesn't cover enough area.
+        The search is automatically preempted by _update_target() when the
+        landing marker is detected at any point.
         """
         elapsed = time.time() - self.state_entry_time
 
-        # Timeout - land wherever we are (counts as a failed attempt).
+        # Timeout — land wherever we are (counts as a failed attempt).
         if elapsed > self.timeout_search:
             print("[STATE] SEARCH TIMEOUT - no marker found. Commanding LAND.")
             self._send("set_mode", mode="LAND")
@@ -281,73 +354,158 @@ class MissionController:
             return
 
         if self._search_phase == 0:
-            # Phase 0: Hover in place (no movement commands).
-            if time.time() - self.state_entry_time >= 5.0:
-                print("[STATE] Hover in place for 5 seconds.")
+            # Phase 0: Initial hover at center for stabilization after climb.
+            if time.time() - self.state_entry_time >= self._search_dwell_s:
+                print("[STATE] Initial hover complete. Starting search pattern.")
+                print(f"[STATE] Search pattern: {len(self._search_waypoints)} waypoints across 3 rings.")
                 self._search_phase = 1
+
         elif self._search_phase == 1:
-            if self._search_attempts >= 2:
-                print("[STATE] Maximum search attempts reached. Commanding LAND.")
+            # Phase 1: Send next waypoint command.
+            if self._search_waypoint_index >= len(self._search_waypoints):
+                print("[STATE] Search pattern exhausted - no marker found. Commanding LAND.")
                 self._send("set_mode", mode="LAND")
-                self._transition_to(FlightState.DESCEND)
+                self._transition_to(FlightState.COMPLETE)
                 return
 
-            print("[STATE] Searching for landing target marker...")
-            self._send("move_local_pos", dx=1.0, dy=0.0, dz=0.0)  # Maintain hover.
-            print("[STATE] Hovering forward 1m, waiting for marker detection...")
-            self._initiate_movement_time = time.time()
-            self._search_attempts += 1
-            self._search_phase = 2  # Move to phase 2 to wait for hover completion.
+            dx, dy = self._search_waypoints[self._search_waypoint_index]
+            ring = self._get_search_ring()
+            wp = self._search_waypoint_index + 1
+            total = len(self._search_waypoints)
+            print(f"[STATE] Waypoint {wp}/{total} (Ring {ring}): dx={dx:+.0f}m, dy={dy:+.0f}m")
+
+            self._send("move_local_pos", dx=float(dx), dy=float(dy), dz=0.0)
+            self._waypoint_sent_time = time.time()
+            self._search_phase = 2
+
         elif self._search_phase == 2:
-            # Phase 2: Maintain hover and check for marker detection.
-            if time.time() - self._initiate_movement_time >= self.timeout_alignment:
-                print("[STATE] Hovering forward 1m complete, continuing search...")
-                self._search_phase = 1  # Loop back to maintain hover.
+            # Phase 2: Wait for travel + dwell, then advance to next waypoint.
+            if time.time() - self._waypoint_sent_time >= self._search_travel_s + self._search_dwell_s:
+                self._search_waypoint_index += 1
+                self._search_phase = 1
+
+    def _get_search_ring(self) -> int:
+        """Return current ring number (1, 2, or 3) based on waypoint index."""
+        if self._search_waypoint_index < 8:
+            return 1
+        if self._search_waypoint_index < 24:
+            return 2
+        return 3
+
+    @staticmethod
+    def _generate_search_waypoints():
+        """Pre-compute the expanding-ring serpentine as relative body-frame moves.
+
+        Each move is 1m in the body frame: dx=forward/back, dy=right/left.
+        The pattern covers a 7x7 grid (3m radius) in three expanding rings:
+
+            Ring 1:  3x3 inner grid  ( 8 moves,  9 positions incl. center)
+            Ring 2:  5x5 outer band  (16 moves, 16 new positions)
+            Ring 3:  7x7 outer band  (24 moves, 24 new positions)
+
+        Total: 48 moves, 49 unique scan positions.
+
+        Ring 1 serpentine (from center):
+            (0,0) → (1,0) → (1,1) → (0,1) → (-1,1) →
+            (-1,0) → (-1,-1) → (0,-1) → (1,-1)
+
+        Rings 2-3 trace the perimeter of each expanding square,
+        visiting only positions not yet covered by inner rings.
+        """
+        # Ring 1: serpentine covering 3x3 grid from center.
+        ring1 = [
+            (1, 0), (0, 1), (-1, 0), (-1, 0),
+            (0, -1), (0, -1), (1, 0), (1, 0),
+        ]
+
+        # Ring 2: clockwise perimeter sweep of 5x5 outer band (16 new positions).
+        # Continues from (1,-1): forward to (2,-1), then right along top,
+        # back down east side, left along bottom, forward up west side.
+        # Ends at (2,-2).
+        ring2 = [
+            (1, 0), (0, 1), (0, 1), (0, 1),
+            (-1, 0), (-1, 0), (-1, 0), (-1, 0),
+            (0, -1), (0, -1), (0, -1), (0, -1),
+            (1, 0), (1, 0), (1, 0), (1, 0),
+        ]
+
+        # Ring 3: clockwise perimeter sweep of 7x7 outer band (24 new positions).
+        # Continues from (2,-2): forward to (3,-2), then right along top,
+        # back down east side, left along bottom, forward up west side.
+        # Ends at (3,-3).
+        ring3 = [
+            (1, 0), (0, 1), (0, 1), (0, 1), (0, 1), (0, 1),
+            (-1, 0), (-1, 0), (-1, 0), (-1, 0), (-1, 0), (-1, 0),
+            (0, -1), (0, -1), (0, -1), (0, -1), (0, -1), (0, -1),
+            (1, 0), (1, 0), (1, 0), (1, 0), (1, 0), (1, 0),
+        ]
+
+        return ring1 + ring2 + ring3
 
 
     def _update_target(self):
-        """Check for landing target detection and handle transition to DESCEND."""
+        """Check for landing target detection and handle transition to DESCEND.
 
-        # Check vision for landing target.
+        Runs every tick regardless of state. When the marker is confirmed
+        (SEARCH_CONFIRM_TICKS consecutive frames), immediately initiates
+        precision landing and transitions to DESCEND.
+
+        During DESCEND:
+            - Throttles LANDING_TARGET messages to 5 Hz (every 200ms) to prevent
+              over-correcting and oscillation.
+            - Ceases sending LANDING_TARGET messages below 0.5m altitude so the
+              drone commits to touchdown without late erratic corrections.
+            - Tracks _last_target_seen_time so _update_descend() can abort if
+              marker is lost at higher altitude (>1.0m).
+        """
         target = self.vision.get_latest_target()
+
         if target is not None and target["marker_id"] == self.landing_target_id:
             self._search_detect_ticks += 1
-            self._send("send_landing_target", target=[target["x_offset_m"], target["y_offset_m"], self._get_altitude()])
-            # print(f"[STATE] Landing target detected at offset ({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m")
+            self._last_target_seen_time = time.time()
+            x_off = target["x_offset_m"]
+            y_off = target["y_offset_m"]
+            alt = self._get_altitude()
+
+            now = time.time()
+            if self.state == FlightState.DESCEND:
+                # During DESCEND: stop corrections below cutoff altitude (commit to touchdown).
+                # Above cutoff: throttle updates to 5 Hz to prevent rapid oscillation.
+                if alt > self.LANDING_TARGET_MIN_ALT_M:
+                    if now - self._last_landing_target_send_time >= self.LANDING_TARGET_SEND_INTERVAL_S:
+                        self._send("send_landing_target", target=[x_off, y_off, alt])
+                        self._last_landing_target_send_time = now
+            else:
+                # During SEARCH: feed target position without throttling for confirmation.
+                self._send("send_landing_target", target=[x_off, y_off, alt])
+                self._last_landing_target_send_time = now
+
             if self.state != FlightState.DESCEND and self._search_detect_ticks >= self.SEARCH_CONFIRM_TICKS:
                 print(
                     f"[STATE] Landing target CONFIRMED ({self._search_detect_ticks} frames) at offset "
-                    f"({target['x_offset_m']:+.3f}, {target['y_offset_m']:+.3f})m"
+                    f"({x_off:+.3f}, {y_off:+.3f})m"
                 )
                 print("[STATE] Transitioning to DESCEND.")
                 print("[STATE] Commanding LAND.")
-                self._send("land_on_target", target=[target["x_offset_m"], target["y_offset_m"], self._get_altitude()], initiate_landing=True)
+                self._send("land_on_target", target=[x_off, y_off, alt], initiate_landing=True)
+                self._last_landing_target_send_time = now
                 self._transition_to(FlightState.DESCEND)
         else:
             self._search_detect_ticks = 0
 
+
     def _update_descend(self):
-        """DESCEND: Precision landing using ArduPilot's LANDING_TARGET system.
+        """DESCEND: Precision landing with marker-lost recovery.
 
-        Instead of manually computing velocity corrections, we continuously
-        feed the target's BODY_FRD position to ArduPilot via LANDING_TARGET
-        messages. ArduPilot's internal precision landing PID controller
-        handles horizontal alignment during the descent.
+        Continuously feeds LANDING_TARGET messages to ArduPilot (via
+        _update_target) while monitoring for touchdown or marker loss.
 
-        On first confirmed detection in this state:
-            1. Send LANDING_TARGET message with target position.
-            2. Send MAV_CMD_NAV_LAND (initiate_landing=True) to begin precision descent.
+        If the marker is lost for more than 3 seconds (after a 2-second
+        grace period), the descent is aborted: the drone switches to
+        GUIDED mode, climbs back to search altitude, and transitions
+        back to SEARCH to resume the waypoint pattern.
 
-        During descent:
-            - If target is visible: send updated LANDING_TARGET at 50 Hz.
-            - If target is temporarily lost: ArduPilot continues descent at last
-              known location (opportunistic precision landing). As soon as the
-              target is reacquired, updates resume seamlessly.
-            - If target was lost before landing was initiated: return to SEARCH to
-              maintain hover and continue looking.
-
-        Touchdown:
-            altitude < 0.15m AND disarmed -> COMPLETE.
+        Touchdown: altitude < 0.15m AND disarmed → COMPLETE.
         """
         elapsed = time.time() - self.state_entry_time
 
@@ -357,6 +515,30 @@ class MissionController:
             self._send("set_mode", mode="LAND")
             self._transition_to(FlightState.COMPLETE)
             return
+
+        # Marker-lost abort: if no detection for 3s (after 2s grace period)
+        # AND still above 1m, give up on this attempt and resume searching.
+        # Below 1m the marker naturally leaves the camera FoV, so just let
+        # ArduPilot finish the landing at the last known position.
+        if elapsed > 2.0 and self._last_target_seen_time > 0.0 and self._get_altitude() > 1.0:
+            time_since_marker = time.time() - self._last_target_seen_time
+            if time_since_marker > 3.0:
+                print(
+                    f"[STATE] Marker lost for {time_since_marker:.1f}s during descent — "
+                    f"aborting landing, returning to SEARCH."
+                )
+                self._send("set_mode", mode="GUIDED")
+
+                # Climb back to search altitude.
+                current_alt = self._get_altitude()
+                climb_needed = self.takeoff_alt - current_alt
+                if climb_needed > 0.1:
+                    self._send("move_local_pos", dx=0.0, dy=0.0, dz=-climb_needed)
+                    print(f"[STATE] Climbing {climb_needed:.1f}m back to search altitude.")
+
+                self._transition_to(FlightState.SEARCH)
+                self._search_phase = 1  # Skip initial hover, resume from next waypoint.
+                return
 
         # Check for touchdown: altitude near zero AND disarmed.
         altitude = self._get_altitude()
@@ -405,6 +587,7 @@ class MissionController:
         self._takeoff_cmd_time = 0.0
         self._search_detect_ticks = 0
         self._land_cmd_sent = False
+        self._last_landing_target_send_time = 0.0
 
         print(f"[STATE] {old} -> {new_state.value}")
 
