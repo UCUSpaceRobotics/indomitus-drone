@@ -31,7 +31,8 @@ import time
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, Pose, Quaternion
+from std_msgs.msg import Int32
 
 from src.utils.grid_mapper import GridMapper
 
@@ -47,31 +48,48 @@ DEFAULT_DETECTION_TIMEOUT_S = 0.05
 class _VisionSubscriberNode(Node):
     """Internal rclpy Node. Not exposed outside this module."""
 
-    def __init__(self, topic: str, on_message_callback):
+    def __init__(
+        self,
+        vision_topic: str,
+        state_topic: str,
+        telemetry_topic: str,
+        on_vision_callback,
+        on_state_callback,
+    ):
         super().__init__("vision_bridge")
-        self.subscription = self.create_subscription(
-            Point, topic, on_message_callback, 10
+        self.vision_sub = self.create_subscription(
+            Point, vision_topic, on_vision_callback, 10
         )
-        self.get_logger().info(f"Subscribed to {topic}")
+        self.state_sub = self.create_subscription(
+            Int32, state_topic, on_state_callback, 10
+        )
+        self.telemetry_pub = self.create_publisher(Pose, telemetry_topic, 10)
+        self.get_logger().info(
+            f"Subscribed to {vision_topic} and {state_topic}; publishing telemetry to {telemetry_topic}"
+        )
 
 
 class VisionBridge:
-    """High-level interface between ROS 2 vision data and the state machine.
+    """High-level interface between ROS 2 vision/telemetry data and the state machine.
 
-    Owns an internal rclpy Node, processes incoming messages, and provides
-    simple getter methods that the state machine polls.
+    Owns an internal rclpy Node, processes incoming vision/state messages, and publishes
+    drone telemetry to the MATLAB Simulink supervisor.
     """
 
     def __init__(
         self,
         topic: str = "/erc/vision_targets",
+        state_topic: str = "/erc/mission_state",
+        telemetry_topic: str = "/erc/drone_telemetry",
         grid_config: dict | None = None,
         detection_timeout_s: float = DEFAULT_DETECTION_TIMEOUT_S,
     ):
         """Create the vision bridge.
 
         Args:
-            topic: ROS 2 topic name to subscribe to.
+            topic: ROS 2 topic name for vision targets (Simulink -> Python).
+            state_topic: ROS 2 topic name for mission state (Simulink -> Python).
+            telemetry_topic: ROS 2 topic name for drone telemetry (Python -> Simulink).
             grid_config: The 'grid' section of mission_params.yaml.
                          If None, probe-to-sector mapping is disabled.
             detection_timeout_s: Seconds after which a detection is considered
@@ -88,15 +106,26 @@ class VisionBridge:
         self._latest_y: float = 0.0
         self._last_detection_time: float = 0.0
 
+        # Latest supervisory state from Simulink.
+        self._latest_simulink_state: int | None = None
+        self._last_state_time: float = 0.0
+
         # Probe detection accumulator.
         # Using a set of sector IDs for automatic deduplication.
         self._detected_probe_sectors: set[str] = set()
 
         # Message counter for diagnostics.
         self._msg_count: int = 0
+        self._state_msg_count: int = 0
 
         # Create the internal ROS 2 node.
-        self._node = _VisionSubscriberNode(topic, self._on_vision_msg)
+        self._node = _VisionSubscriberNode(
+            vision_topic=topic,
+            state_topic=state_topic,
+            telemetry_topic=telemetry_topic,
+            on_vision_callback=self._on_vision_msg,
+            on_state_callback=self._on_state_msg,
+        )
 
     # ------------------------------------------------------------------
     # Public API — called by the state machine
@@ -138,6 +167,54 @@ class VisionBridge:
             "age_s": age,
         }
 
+    def publish_telemetry(
+        self,
+        alt: float,
+        is_armed: bool,
+        ekf_healthy: bool,
+        origin_dist: float,
+        connected: bool,
+        manual_override: bool,
+        waypoints_exhausted: bool,
+    ) -> None:
+        """Publish real-time telemetry to the MATLAB Simulink supervisor.
+
+        Packed into a geometry_msgs/msg/Pose message:
+            position.x    = alt (meters)
+            position.y    = is_armed (1.0 / 0.0)
+            position.z    = ekf_healthy (1.0 / 0.0)
+            orientation.x = origin_dist (meters)
+            orientation.y = connected (1.0 / 0.0)
+            orientation.z = manual_override (1.0 / 0.0)
+            orientation.w = waypoints_exhausted (1.0 / 0.0)
+        """
+        msg = Pose(
+            position=Point(
+                x=float(alt),
+                y=1.0 if is_armed else 0.0,
+                z=1.0 if ekf_healthy else 0.0,
+            ),
+            orientation=Quaternion(
+                x=float(origin_dist),
+                y=1.0 if connected else 0.0,
+                z=1.0 if manual_override else 0.0,
+                w=1.0 if waypoints_exhausted else 0.0,
+            ),
+        )
+        self._node.telemetry_pub.publish(msg)
+
+    def get_simulink_state(self) -> int | None:
+        """Return the latest supervisory mission state commanded by Simulink.
+
+        Returns:
+            int (0=IDLE, 1=TAKEOFF, 2=SEARCH, 3=DESCEND, 4=COMPLETE), or None if no state received.
+        """
+        return self._latest_simulink_state
+
+    def get_state_message_count(self) -> int:
+        """Return the total number of state messages received from Simulink."""
+        return self._state_msg_count
+
     def get_detected_probes(self) -> list[str]:
         """Return all unique probe sector IDs detected so far.
 
@@ -164,8 +241,14 @@ class VisionBridge:
         self._node.destroy_node()
 
     # ------------------------------------------------------------------
-    # Internal callback
+    # Internal callbacks
     # ------------------------------------------------------------------
+
+    def _on_state_msg(self, msg: Int32) -> None:
+        """Called by rclpy when a new mission state arrives from Simulink."""
+        self._state_msg_count += 1
+        self._latest_simulink_state = int(msg.data)
+        self._last_state_time = time.time()
 
     def _on_vision_msg(self, msg: Point) -> None:
         """Called by rclpy when a new Point message arrives.

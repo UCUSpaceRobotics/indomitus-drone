@@ -41,17 +41,29 @@ class FlightState(Enum):
     COMPLETE = "COMPLETE"
 
 
+# Mapping from Simulink integer state codes to Python FlightState enum.
+SIMULINK_STATE_MAP: dict[int, FlightState] = {
+    0: FlightState.IDLE,
+    1: FlightState.TAKEOFF,
+    2: FlightState.SEARCH,
+    3: FlightState.DESCEND,
+    4: FlightState.COMPLETE,
+}
+
+
 class MissionController:
     """Finite state machine controlling a single autonomous drone mission.
 
     Architecture:
         - Reads drone telemetry from telemetry_queue (filled by mavlink_node.py).
-        - Reads vision data from VisionBridge (filled by Simulink via ROS 2).
+        - Reads vision & supervisor state from VisionBridge (filled by Simulink via ROS 2).
+        - Publishes drone telemetry to Simulink on /erc/drone_telemetry.
         - Sends flight commands to command_queue (consumed by mavlink_node.py).
 
     Safety features:
-        - Geofence: emergency LAND if the drone drifts >3 m from takeoff origin.
-        - Timeouts: every state has a timeout that triggers LAND on expiry.
+        - Geofence: emergency BRAKE then LAND if the drone drifts >8 m from takeoff origin.
+        - Timeouts: every state has a timeout that triggers controlled descent on expiry.
+        - Pilot Manual Override: instantly yields control if RC flight mode is toggled.
 
     Args:
         command_queue: multiprocessing.Queue for sending commands to the comm process.
@@ -131,23 +143,33 @@ class MissionController:
         Called ~50 times/second by the main loop. This is the ONLY method
         the main loop calls. Internally it:
             1. Refreshes telemetry from the comm process queue.
-            2. Processes pending ROS 2 vision messages.
+            2. Processes pending ROS 2 vision & state messages.
             3. Checks for external manual override or autopilot failsafe.
-            4. Checks geofence safety.
-            5. Dispatches to the handler for the current state.
-            6. Updates precision landing target stream.
-            7. Updates the LED indicator state.
+            4. Checks geofence safety (BRAKE -> LAND on breach).
+            5. Publishes real-time telemetry to Simulink supervisor.
+            6. Synchronizes state with Simulink supervisor.
+            7. Dispatches to the handler for the current state.
+            8. Updates precision landing target stream (runs at 50 Hz).
+            9. Updates the LED indicator state.
         """
         self._refresh_telemetry()
         self.vision.spin_once()
 
         # Check if pilot intervened on RC or Pixhawk entered failsafe (e.g. Battery Failsafe LAND/RTL).
         if self._check_external_override_or_failsafe():
+            self._publish_telemetry_to_simulink(manual_override=True)
             return
 
         # Safety: emergency land if drone drifts too far from origin.
         if self._check_geofence():
-            return  # State was forced to COMPLETE, skip normal handler.
+            self._publish_telemetry_to_simulink(manual_override=False)
+            return
+
+        # Publish telemetry to Simulink supervisor on every tick.
+        self._publish_telemetry_to_simulink(manual_override=False)
+
+        # Synchronize with Simulink state supervisor.
+        self._sync_simulink_state()
 
         if self.state == FlightState.IDLE:
             self._update_idle()
@@ -158,9 +180,56 @@ class MissionController:
         elif self.state == FlightState.DESCEND:
             self._update_descend()
         # COMPLETE: do nothing, main loop will exit.
+
+        # Continuously process vision detection and MAVLink streaming on every tick.
         self._update_target()
 
         self._update_led_indicator()
+
+    # ==================================================================
+    # Simulink Synchronization & Telemetry
+    # ==================================================================
+
+    def _publish_telemetry_to_simulink(self, manual_override: bool = False):
+        """Send current drone state to MATLAB Simulink over /erc/drone_telemetry."""
+        alt = self._get_altitude()
+        is_armed = bool(self.telem.get("armed", False))
+        ekf_healthy = bool(self.telem.get("ekf_healthy", False))
+        pos_x = self.telem.get("pos_x_m", 0.0)
+        pos_y = self.telem.get("pos_y_m", 0.0)
+        origin_dist = math.sqrt(pos_x ** 2 + pos_y ** 2)
+        connected = bool(self.telem.get("connected", False))
+        waypoints_exhausted = (self._search_waypoint_index >= len(self._search_waypoints))
+
+        self.vision.publish_telemetry(
+            alt=alt,
+            is_armed=is_armed,
+            ekf_healthy=ekf_healthy,
+            origin_dist=origin_dist,
+            connected=connected,
+            manual_override=manual_override,
+            waypoints_exhausted=waypoints_exhausted,
+        )
+
+    def _sync_simulink_state(self):
+        """Check if Simulink supervisor commanded a state transition."""
+        sim_state_int = self.vision.get_simulink_state()
+        if sim_state_int is None:
+            return
+
+        target_state = SIMULINK_STATE_MAP.get(sim_state_int)
+        if target_state is not None and target_state != self.state:
+            print(f"[STATE] [SIMULINK COMMAND] State transition: {self.state.value} -> {target_state.value}")
+            if target_state == FlightState.DESCEND and self.state != FlightState.DESCEND:
+                # Entering DESCEND from Simulink command:
+                target = self.vision.get_latest_target()
+                if target is not None and target["marker_id"] == self.landing_target_id:
+                    alt = self._get_altitude()
+                    self._send("land_on_target", target=[target["x_offset_m"], target["y_offset_m"], alt], initiate_landing=True)
+                else:
+                    self._send("set_mode", mode="BRAKE")
+                    self._send("set_mode", mode="LAND")
+            self._transition_to(target_state)
 
     # ==================================================================
     # Safety
@@ -176,9 +245,9 @@ class MissionController:
 
         mode = self.telem.get("mode", "UNKNOWN")
 
-        # 1. BREAK is always an immediate abort in an enclosed competition area.
-        if mode == "BREAK":
-            print(f"[STATE] [FAILSAFE/OVERRIDE] BREAK mode detected. Aborting mission.")
+        # 1. BRAKE is always an immediate abort in an enclosed competition area.
+        if mode == "BRAKE" and self.state not in (FlightState.DESCEND, FlightState.COMPLETE):
+            print(f"[STATE] [FAILSAFE/OVERRIDE] BRAKE mode detected. Aborting mission.")
             self._transition_to(FlightState.COMPLETE)
             return True
 
@@ -191,7 +260,7 @@ class MissionController:
             self._transition_to(FlightState.COMPLETE)
             return True
 
-        # 3. In TAKEOFF (climbing phase, _takeoff_phase >= 3): Flight mode must be GUIDED.
+        # 3. In TAKEOFF (climbing phase, _takeoff_phase >= 4): Flight mode must be GUIDED.
         if self.state == FlightState.TAKEOFF and self._takeoff_phase >= 4 and mode != "GUIDED":
             print(
                 f"[STATE] [OVERRIDE] Mode changed to {mode} during takeoff climb. "
@@ -200,8 +269,8 @@ class MissionController:
             self._transition_to(FlightState.COMPLETE)
             return True
 
-        # 4. In DESCEND: Pilot manual takeover (switching out of GUIDED/LAND).
-        if self.state == FlightState.DESCEND and mode not in ("GUIDED", "LAND"):
+        # 4. In DESCEND: Pilot manual takeover (switching out of GUIDED/LAND/BRAKE).
+        if self.state == FlightState.DESCEND and mode not in ("GUIDED", "LAND", "BRAKE"):
             print(
                 f"[STATE] [OVERRIDE] Pilot took manual control ({mode}) during descent. "
                 "Aborting mission."
@@ -212,13 +281,13 @@ class MissionController:
         return False
 
     def _check_geofence(self) -> bool:
-        """Emergency LAND if the drone drifts too far from the takeoff origin.
+        """Emergency BRAKE then LAND if the drone drifts too far from the takeoff origin.
 
-        Returns True if geofence was breached and state was forced to COMPLETE.
+        Returns True if geofence was breached and state was forced to DESCEND.
         """
         if not self.telem:
             return False
-        if self.state in (FlightState.IDLE, FlightState.COMPLETE):
+        if self.state in (FlightState.IDLE, FlightState.COMPLETE, FlightState.DESCEND):
             return False
 
         x = self.telem.get("pos_x_m", 0.0)
@@ -228,10 +297,11 @@ class MissionController:
         if distance > self.MAX_DISTANCE_FROM_ORIGIN_M:
             print(
                 f"[STATE] [GEOFENCE BREACH] {distance:.2f}m from origin "
-                f"(limit: {self.MAX_DISTANCE_FROM_ORIGIN_M}m). Emergency LAND."
+                f"(limit: {self.MAX_DISTANCE_FROM_ORIGIN_M}m). Emergency BRAKE -> LAND."
             )
+            self._send("set_mode", mode="BRAKE")
             self._send("set_mode", mode="LAND")
-            self._transition_to(FlightState.COMPLETE)
+            self._transition_to(FlightState.DESCEND)
             return True
 
         return False
@@ -286,9 +356,10 @@ class MissionController:
 
         # Timeout failsafe.
         if elapsed > self.timeout_takeoff:
-            print("[STATE] TAKEOFF TIMEOUT - commanding LAND.")
+            print("[STATE] TAKEOFF TIMEOUT - commanding BRAKE -> LAND.")
+            self._send("set_mode", mode="BRAKE")
             self._send("set_mode", mode="LAND")
-            self._transition_to(FlightState.COMPLETE)
+            self._transition_to(FlightState.DESCEND)
             return
 
         if self._takeoff_phase == 0:
@@ -323,9 +394,9 @@ class MissionController:
                 self._takeoff_phase = 4
 
         elif self._takeoff_phase == 4:
-            # Phase 4: Monitor altitude.
+            # Phase 4: Monitor altitude (85% threshold = 1.275m for 1.5m target).
             altitude = self._get_altitude()
-            target_threshold = self.takeoff_alt * 0.9
+            target_threshold = self.takeoff_alt * 0.85
 
             if altitude >= target_threshold:
                 print(f"[STATE] Takeoff complete. Altitude: {altitude:.2f}m (target: {self.takeoff_alt}m)")
@@ -348,9 +419,10 @@ class MissionController:
 
         # Timeout — land wherever we are (counts as a failed attempt).
         if elapsed > self.timeout_search:
-            print("[STATE] SEARCH TIMEOUT - no marker found. Commanding LAND.")
+            print("[STATE] SEARCH TIMEOUT - no marker found. Commanding BRAKE -> LAND.")
+            self._send("set_mode", mode="BRAKE")
             self._send("set_mode", mode="LAND")
-            self._transition_to(FlightState.COMPLETE)
+            self._transition_to(FlightState.DESCEND)
             return
 
         if self._search_phase == 0:
@@ -363,9 +435,10 @@ class MissionController:
         elif self._search_phase == 1:
             # Phase 1: Send next waypoint command.
             if self._search_waypoint_index >= len(self._search_waypoints):
-                print("[STATE] Search pattern exhausted - no marker found. Commanding LAND.")
+                print("[STATE] Search pattern exhausted - no marker found. Commanding BRAKE -> LAND.")
+                self._send("set_mode", mode="BRAKE")
                 self._send("set_mode", mode="LAND")
-                self._transition_to(FlightState.COMPLETE)
+                self._transition_to(FlightState.DESCEND)
                 return
 
             dx, dy = self._search_waypoints[self._search_waypoint_index]
@@ -505,15 +578,16 @@ class MissionController:
         GUIDED mode, climbs back to search altitude, and transitions
         back to SEARCH to resume the waypoint pattern.
 
-        Touchdown: altitude < 0.15m AND disarmed → COMPLETE.
+        Touchdown: altitude < 0.25m AND disarmed → COMPLETE.
         """
         elapsed = time.time() - self.state_entry_time
 
-        # Timeout failsafe - force completion if landing takes too long.
+        # Timeout failsafe - force completion if landing takes too long and disarmed.
         if elapsed > self.timeout_descend:
-            print("[STATE] DESCEND TIMEOUT - assuming touchdown.")
+            print("[STATE] DESCEND TIMEOUT - ensuring LAND mode.")
             self._send("set_mode", mode="LAND")
-            self._transition_to(FlightState.COMPLETE)
+            if not self.telem.get("armed", True):
+                self._transition_to(FlightState.COMPLETE)
             return
 
         # Marker-lost abort: if no detection for 3s (after 2s grace period)
@@ -540,11 +614,11 @@ class MissionController:
                 self._search_phase = 1  # Skip initial hover, resume from next waypoint.
                 return
 
-        # Check for touchdown: altitude near zero AND disarmed.
+        # Check for touchdown: altitude near ground (< 0.25m) AND disarmed.
         altitude = self._get_altitude()
         armed = self.telem.get("armed", True)
 
-        if altitude < 0.15 and not armed:
+        if altitude < 0.25 and not armed:
             print(f"[STATE] TOUCHDOWN confirmed. Altitude: {altitude:.2f}m, armed: {armed}")
             self._transition_to(FlightState.COMPLETE)
             return
