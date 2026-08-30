@@ -212,7 +212,11 @@ class MissionController:
         )
 
     def _sync_simulink_state(self):
-        """Check if Simulink supervisor commanded a state transition."""
+        """Check if Simulink supervisor commanded a state transition.
+
+        This is the single master transition hub. All state transitions
+        originate from the MATLAB supervisor.
+        """
         if self.state == FlightState.COMPLETE:
             return  # Once COMPLETE, mission is finished; never accept any state changes.
 
@@ -223,15 +227,40 @@ class MissionController:
         target_state = SIMULINK_STATE_MAP.get(sim_state_int)
         if target_state is not None and target_state != self.state:
             print(f"[STATE] [SIMULINK COMMAND] State transition: {self.state.value} -> {target_state.value}")
-            if target_state == FlightState.DESCEND and self.state != FlightState.DESCEND:
-                # Entering DESCEND from Simulink command:
+
+            # Handle transition entry actions:
+            if target_state == FlightState.TAKEOFF:
+                self._takeoff_phase = 0
+                self._takeoff_cmd_time = time.time()
+
+            elif target_state == FlightState.SEARCH:
+                # If recovering from aborted descent, skip initial hover and resume search
+                if self.state == FlightState.DESCEND:
+                    print("[STATE] Aborting descent — returning to GUIDED and climbing to search altitude.")
+                    self._send("set_mode", mode="GUIDED")
+                    current_alt = self._get_altitude()
+                    climb_needed = self.takeoff_alt - current_alt
+                    if climb_needed > 0.1:
+                        self._send("move_local_pos", dx=0.0, dy=0.0, dz=-climb_needed)
+                    self._search_phase = 1
+                else:
+                    self._search_phase = 0
+
+            elif target_state == FlightState.DESCEND:
+                # Entering DESCEND: check if marker was confirmed or if this is a failsafe landing
                 target = self.vision.get_latest_target()
                 if target is not None and target["marker_id"] == self.landing_target_id:
                     alt = self._get_altitude()
+                    print(f"[STATE] Initiating Precision Landing on marker {self.landing_target_id}.")
                     self._send("land_on_target", target=[target["x_offset_m"], target["y_offset_m"], alt], initiate_landing=True)
                 else:
+                    print("[STATE] Failsafe / Timeout landing — commanding BRAKE -> LAND.")
                     self._send("set_mode", mode="BRAKE")
                     self._send("set_mode", mode="LAND")
+
+            elif target_state == FlightState.COMPLETE:
+                print(f"[STATE] Touchdown confirmed. Final state: COMPLETE.")
+
             self._transition_to(target_state)
 
     # ==================================================================
@@ -310,7 +339,7 @@ class MissionController:
         return False
 
     # ==================================================================
-    # State handlers
+    # State handlers (Execution Routines — Transitions supervised by MATLAB)
     # ==================================================================
 
     def _update_idle(self):
@@ -339,32 +368,17 @@ class MissionController:
             )
             return
 
-        # All conditions met - clear to take off.
-        print("[STATE] Pixhawk connected, EKF healthy, origin stable. Starting mission.")
-        self._transition_to(FlightState.TAKEOFF)
+        self._log_throttled("Pixhawk connected, EKF healthy, origin stable. Awaiting Simulink TAKEOFF command...")
 
     def _update_takeoff(self):
-        """TAKEOFF: Arm, switch to GUIDED, command takeoff, monitor altitude.
-
-        Uses a phase counter to sequence sub-steps. Each phase sends a command
-        once and then waits for the expected telemetry confirmation.
+        """TAKEOFF: Arm, switch to GUIDED, command takeoff, monitor climb.
 
         Phase 0: Set LOITER mode (needed for optical-flow-based arming).
         Phase 1: Send ARM command.
         Phase 2: Wait for armed confirmation, then switch to GUIDED.
         Phase 3: Send takeoff command.
-        Phase 4: Monitor altitude until target reached.
+        Phase 4: Monitor climb (transition to SEARCH commanded by MATLAB when alt >= 85%).
         """
-        elapsed = time.time() - self.state_entry_time
-
-        # Timeout failsafe.
-        if elapsed > self.timeout_takeoff:
-            print("[STATE] TAKEOFF TIMEOUT - commanding BRAKE -> LAND.")
-            self._send("set_mode", mode="BRAKE")
-            self._send("set_mode", mode="LAND")
-            self._transition_to(FlightState.DESCEND)
-            return
-
         if self._takeoff_phase == 0:
             # Phase 0: Set LOITER (required for arming with optical flow).
             self._send("set_mode", mode="LOITER")
@@ -397,13 +411,9 @@ class MissionController:
                 self._takeoff_phase = 4
 
         elif self._takeoff_phase == 4:
-            # Phase 4: Monitor altitude (85% threshold = 1.275m for 1.5m target).
+            # Phase 4: Actively climbing.
             altitude = self._get_altitude()
-            target_threshold = self.takeoff_alt * 0.85
-
-            if altitude >= target_threshold:
-                print(f"[STATE] Takeoff complete. Altitude: {altitude:.2f}m (target: {self.takeoff_alt}m)")
-                self._transition_to(FlightState.SEARCH)
+            self._log_throttled(f"Climbing... Altitude: {altitude:.2f}m / {self.takeoff_alt:.2f}m")
 
     def _update_search(self):
         """SEARCH: Fly an expanding-ring serpentine pattern to find the landing marker.
@@ -414,20 +424,7 @@ class MissionController:
 
         Pattern: center → 3×3 ring → 5×5 ring → 7×7 ring.
         Body-frame relative moves (dx=forward, dy=right), 1m each.
-
-        The search is automatically preempted by _update_target() when the
-        landing marker is detected at any point.
         """
-        elapsed = time.time() - self.state_entry_time
-
-        # Timeout — land wherever we are (counts as a failed attempt).
-        if elapsed > self.timeout_search:
-            print("[STATE] SEARCH TIMEOUT - no marker found. Commanding BRAKE -> LAND.")
-            self._send("set_mode", mode="BRAKE")
-            self._send("set_mode", mode="LAND")
-            self._transition_to(FlightState.DESCEND)
-            return
-
         if self._search_phase == 0:
             # Phase 0: Initial hover at center for stabilization after climb.
             if time.time() - self.state_entry_time >= self._search_dwell_s:
@@ -438,10 +435,7 @@ class MissionController:
         elif self._search_phase == 1:
             # Phase 1: Send next waypoint command.
             if self._search_waypoint_index >= len(self._search_waypoints):
-                print("[STATE] Search pattern exhausted - no marker found. Commanding BRAKE -> LAND.")
-                self._send("set_mode", mode="BRAKE")
-                self._send("set_mode", mode="LAND")
-                self._transition_to(FlightState.DESCEND)
+                self._log_throttled("Search pattern exhausted — awaiting Simulink command...")
                 return
 
             dx, dy = self._search_waypoints[self._search_waypoint_index]
@@ -480,13 +474,6 @@ class MissionController:
             Ring 3:  7x7 outer band  (24 moves, 24 new positions)
 
         Total: 48 moves, 49 unique scan positions.
-
-        Ring 1 serpentine (from center):
-            (0,0) → (1,0) → (1,1) → (0,1) → (-1,1) →
-            (-1,0) → (-1,-1) → (0,-1) → (1,-1)
-
-        Rings 2-3 trace the perimeter of each expanding square,
-        visiting only positions not yet covered by inner rings.
         """
         # Ring 1: serpentine covering 3x3 grid from center.
         ring1 = [
@@ -495,9 +482,6 @@ class MissionController:
         ]
 
         # Ring 2: clockwise perimeter sweep of 5x5 outer band (16 new positions).
-        # Continues from (1,-1): forward to (2,-1), then right along top,
-        # back down east side, left along bottom, forward up west side.
-        # Ends at (2,-2).
         ring2 = [
             (1, 0), (0, 1), (0, 1), (0, 1),
             (-1, 0), (-1, 0), (-1, 0), (-1, 0),
@@ -506,9 +490,6 @@ class MissionController:
         ]
 
         # Ring 3: clockwise perimeter sweep of 7x7 outer band (24 new positions).
-        # Continues from (2,-2): forward to (3,-2), then right along top,
-        # back down east side, left along bottom, forward up west side.
-        # Ends at (3,-3).
         ring3 = [
             (1, 0), (0, 1), (0, 1), (0, 1), (0, 1), (0, 1),
             (-1, 0), (-1, 0), (-1, 0), (-1, 0), (-1, 0), (-1, 0),
@@ -520,24 +501,14 @@ class MissionController:
 
 
     def _update_target(self):
-        """Check for landing target detection and handle transition to DESCEND.
+        """Process landing target detection and stream LANDING_TARGET messages at 50 Hz.
 
-        Runs every tick regardless of state. When the marker is confirmed
-        (SEARCH_CONFIRM_TICKS consecutive frames), immediately initiates
-        precision landing and transitions to DESCEND.
-
-        During DESCEND:
-            - Throttles LANDING_TARGET messages to 5 Hz (every 200ms) to prevent
-              over-correcting and oscillation.
-            - Ceases sending LANDING_TARGET messages below 0.5m altitude so the
-              drone commits to touchdown without late erratic corrections.
-            - Tracks _last_target_seen_time so _update_descend() can abort if
-              marker is lost at higher altitude (>1.0m).
+        Continuously feeds LANDING_TARGET measurements to ArduPilot during DESCEND
+        so the flight controller can steer to the landing target.
         """
         target = self.vision.get_latest_target()
 
         if target is not None and target["marker_id"] == self.landing_target_id:
-            self._search_detect_ticks += 1
             self._last_target_seen_time = time.time()
             x_off = target["x_offset_m"]
             y_off = target["y_offset_m"]
@@ -551,80 +522,20 @@ class MissionController:
                     if now - self._last_landing_target_send_time >= self.LANDING_TARGET_SEND_INTERVAL_S:
                         self._send("send_landing_target", target=[x_off, y_off, alt])
                         self._last_landing_target_send_time = now
-            else:
-                # During SEARCH: feed target position without throttling for confirmation.
+            elif self.state == FlightState.SEARCH:
+                # During SEARCH: pre-warm target position stream
                 self._send("send_landing_target", target=[x_off, y_off, alt])
                 self._last_landing_target_send_time = now
 
-            if self.state != FlightState.DESCEND and self._search_detect_ticks >= self.SEARCH_CONFIRM_TICKS:
-                print(
-                    f"[STATE] Landing target CONFIRMED ({self._search_detect_ticks} frames) at offset "
-                    f"({x_off:+.3f}, {y_off:+.3f})m"
-                )
-                print("[STATE] Transitioning to DESCEND.")
-                print("[STATE] Commanding LAND.")
-                self._send("land_on_target", target=[x_off, y_off, alt], initiate_landing=True)
-                self._last_landing_target_send_time = now
-                self._transition_to(FlightState.DESCEND)
-        else:
-            self._search_detect_ticks = 0
-
 
     def _update_descend(self):
-        """DESCEND: Precision landing with marker-lost recovery.
+        """DESCEND: Precision landing execution.
 
-        Continuously feeds LANDING_TARGET messages to ArduPilot (via
-        _update_target) while monitoring for touchdown or marker loss.
-
-        If the marker is lost for more than 3 seconds (after a 2-second
-        grace period), the descent is aborted: the drone switches to
-        GUIDED mode, climbs back to search altitude, and transitions
-        back to SEARCH to resume the waypoint pattern.
-
-        Touchdown: altitude < 0.25m AND disarmed → COMPLETE.
+        Continuously feeds LANDING_TARGET messages to ArduPilot (via _update_target).
+        State transitions (touchdown or lost-marker recovery) are supervised by MATLAB.
         """
-        elapsed = time.time() - self.state_entry_time
-
-        # Timeout failsafe - force completion if landing takes too long and disarmed.
-        if elapsed > self.timeout_descend:
-            print("[STATE] DESCEND TIMEOUT - ensuring LAND mode.")
-            self._send("set_mode", mode="LAND")
-            if not self.telem.get("armed", True):
-                self._transition_to(FlightState.COMPLETE)
-            return
-
-        # Marker-lost abort: if no detection for 3s (after 2s grace period)
-        # AND still above 1m, give up on this attempt and resume searching.
-        # Below 1m the marker naturally leaves the camera FoV, so just let
-        # ArduPilot finish the landing at the last known position.
-        if elapsed > 2.0 and self._last_target_seen_time > 0.0 and self._get_altitude() > 1.0:
-            time_since_marker = time.time() - self._last_target_seen_time
-            if time_since_marker > 3.0:
-                print(
-                    f"[STATE] Marker lost for {time_since_marker:.1f}s during descent — "
-                    f"aborting landing, returning to SEARCH."
-                )
-                self._send("set_mode", mode="GUIDED")
-
-                # Climb back to search altitude.
-                current_alt = self._get_altitude()
-                climb_needed = self.takeoff_alt - current_alt
-                if climb_needed > 0.1:
-                    self._send("move_local_pos", dx=0.0, dy=0.0, dz=-climb_needed)
-                    print(f"[STATE] Climbing {climb_needed:.1f}m back to search altitude.")
-
-                self._transition_to(FlightState.SEARCH)
-                self._search_phase = 1  # Skip initial hover, resume from next waypoint.
-                return
-
-        # Check for touchdown: altitude near ground (< 0.25m) AND disarmed.
         altitude = self._get_altitude()
-        armed = self.telem.get("armed", True)
-
-        if altitude < 0.25 and not armed:
-            print(f"[STATE] TOUCHDOWN confirmed. Altitude: {altitude:.2f}m, armed: {armed}")
-            self._transition_to(FlightState.COMPLETE)
-            return
+        self._log_throttled(f"Descending... Altitude: {altitude:.2f}m")
 
 
     # ==================================================================

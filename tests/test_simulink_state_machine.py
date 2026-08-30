@@ -1,4 +1,4 @@
-﻿"""Unit tests for state machine with Simulink synchronization."""
+﻿"""Unit tests for state machine with Strict Simulink supervisor authority."""
 
 import queue
 import unittest
@@ -80,6 +80,7 @@ class TestSimulinkStateMachine(unittest.TestCase):
             "connected": True,
             "mode": "GUIDED",
         })
+        # Simulink supervisor commands SEARCH (state 2)
         self.vision.simulink_state = 2
         self.mission.update()
         self.assertEqual(self.mission.state, FlightState.SEARCH)
@@ -102,18 +103,19 @@ class TestSimulinkStateMachine(unittest.TestCase):
             cmds.append(self.cmd_q.get()["action"])
         self.assertIn("set_mode", cmds)
 
-    def test_touchdown_to_complete(self):
+    def test_simulink_command_touchdown_to_complete(self):
         self.mission.state = FlightState.DESCEND
-        self.vision.simulink_state = 3  # Simulink is in DESCEND
         self.telem_q.put({
             "pos_x_m": 0.0,
             "pos_y_m": 0.0,
-            "pos_z_m": -0.1,  # alt = 0.1m < 0.25m
-            "armed": False,   # disarmed
+            "pos_z_m": -0.1,
+            "armed": False,
             "ekf_healthy": True,
             "connected": True,
             "mode": "LAND",
         })
+        # Simulink supervisor sees alt < 0.25 and disarmed -> commands COMPLETE (state 4)
+        self.vision.simulink_state = 4
         self.mission.update()
         self.assertEqual(self.mission.state, FlightState.COMPLETE)
 
