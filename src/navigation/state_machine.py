@@ -213,6 +213,9 @@ class MissionController:
 
     def _sync_simulink_state(self):
         """Check if Simulink supervisor commanded a state transition."""
+        if self.state == FlightState.COMPLETE:
+            return  # Once COMPLETE, mission is finished; never accept any state changes.
+
         sim_state_int = self.vision.get_simulink_state()
         if sim_state_int is None:
             return
