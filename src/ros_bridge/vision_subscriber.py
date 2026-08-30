@@ -209,6 +209,8 @@ class VisionBridge:
         Returns:
             int (0=IDLE, 1=TAKEOFF, 2=SEARCH, 3=DESCEND, 4=COMPLETE), or None if no state received.
         """
+        if self._last_state_time >= 0.5:
+            return None
         return self._latest_simulink_state
 
     def get_state_message_count(self) -> int:

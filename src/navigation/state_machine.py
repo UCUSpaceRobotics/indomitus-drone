@@ -90,11 +90,6 @@ class MissionController:
         self.state = FlightState.IDLE
         self.state_entry_time = time.time()
 
-        # Timeouts (seconds).
-        self.timeout_takeoff = config["timeouts"]["takeoff_s"]
-        self.timeout_search = config["timeouts"]["search_sweep_s"]
-        self.timeout_descend = config["timeouts"]["landing_s"]
-        self.timeout_alignment = config["timeouts"]["alignment_s"]
 
         # Flight parameters.
         self.takeoff_alt = config["flight"]["takeoff_altitude_m"]
@@ -223,10 +218,18 @@ class MissionController:
 
         sim_state_int = self.vision.get_simulink_state()
         if sim_state_int is None:
+            print(f"[STATE] [SIMULINK COMMAND] Bad connection with Simulink: {sim_state_int}")
             return
 
         target_state = SIMULINK_STATE_MAP.get(sim_state_int)
-        if target_state is not None and target_state != self.state:
+        if target_state != self.state:
+            if target_state is None:
+                print(f"[STATE] [SIMULINK COMMAND] No map to Simulink state or no state change: {self.state.value} (Simulink={sim_state_int})")
+                print(f"[STATE] [SIMULINK COMMAND] Forcing LAND command to Pixhawk for safety.")
+                self._send("land")
+                self._transition_to(FlightState.COMPLETE)  # Force COMPLETE if Simulink state is invalid or no change.
+                return
+
             print(f"[STATE] [SIMULINK COMMAND] State transition: {self.state.value} -> {target_state.value}")
 
             # Handle transition entry actions:
@@ -248,19 +251,10 @@ class MissionController:
                     self._search_phase = 0
 
             elif target_state == FlightState.DESCEND:
-                # Entering DESCEND: check if marker was confirmed or seen recently (within 2 seconds)
-                target = self.vision.get_latest_target()
-                is_recent = (time.time() - self._last_target_seen_time < 2.0) if self._last_target_seen_time > 0 else False
+                # If descending from TAKEOFF, reset takeoff phase.
+                self._send("land")
+                print("[STATE] DESCEND commanded — sended LAND to Pixhawk.")
 
-                if (target is not None and target["marker_id"] == self.landing_target_id) or is_recent:
-                    alt = self._get_altitude()
-                    offset = [target["x_offset_m"], target["y_offset_m"]] if target is not None else self._last_landing_target_offset
-                    print(f"[STATE] Initiating Precision Landing on marker {self.landing_target_id} at offset ({offset[0]:+.2f}, {offset[1]:+.2f})m.")
-                    self._send("land_on_target", target=[offset[0], offset[1], alt], initiate_landing=True)
-                else:
-                    print("[STATE] Failsafe / Timeout landing — commanding BRAKE -> LAND.")
-                    self._send("set_mode", mode="BRAKE")
-                    self._send("set_mode", mode="LAND")
 
             elif target_state == FlightState.COMPLETE:
                 print(f"[STATE] Touchdown confirmed. Final state: COMPLETE.")
