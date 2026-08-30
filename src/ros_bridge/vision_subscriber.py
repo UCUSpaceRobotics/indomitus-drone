@@ -41,8 +41,8 @@ from src.utils.grid_mapper import GridMapper
 MARKER_ID_ORIGIN = 101
 MARKER_ID_LANDING = 102
 
-# How old a detection can be before we consider it stale.
-DEFAULT_DETECTION_TIMEOUT_S = 0.05
+# How old a detection can be before we consider it stale (300ms = ~4.5 frames at 15 FPS).
+DEFAULT_DETECTION_TIMEOUT_S = 0.3
 
 
 class _VisionSubscriberNode(Node):

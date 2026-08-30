@@ -125,6 +125,9 @@ def main():
     # ------------------------------------------------------------------
     # 8. Create the VisionBridge (ROS 2 subscriber)
     # ------------------------------------------------------------------
+    
+    from src.ros_bridge.vision_subscriber import VisionBridge
+    
     vision = VisionBridge(
         topic=config["ros2"]["vision_topic"],
         state_topic=config["ros2"].get("mission_state_topic", "/erc/mission_state"),

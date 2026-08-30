@@ -121,8 +121,9 @@ class MissionController:
         self._search_dwell_s = 3.0   # Seconds to hover at each waypoint for scanning
         self._search_travel_s = 4.0  # Seconds allocated for 1m travel between waypoints
 
-        # Target tracking: timestamp of last marker sighting (used for descent abort).
+        # Target tracking: timestamp and last known offset of marker sighting.
         self._last_target_seen_time = 0.0
+        self._last_landing_target_offset = [0.0, 0.0]
 
         # Landing target message rate limiting & cutoff during descent.
         self._last_landing_target_send_time = 0.0
@@ -247,12 +248,15 @@ class MissionController:
                     self._search_phase = 0
 
             elif target_state == FlightState.DESCEND:
-                # Entering DESCEND: check if marker was confirmed or if this is a failsafe landing
+                # Entering DESCEND: check if marker was confirmed or seen recently (within 2 seconds)
                 target = self.vision.get_latest_target()
-                if target is not None and target["marker_id"] == self.landing_target_id:
+                is_recent = (time.time() - self._last_target_seen_time < 2.0) if self._last_target_seen_time > 0 else False
+
+                if (target is not None and target["marker_id"] == self.landing_target_id) or is_recent:
                     alt = self._get_altitude()
-                    print(f"[STATE] Initiating Precision Landing on marker {self.landing_target_id}.")
-                    self._send("land_on_target", target=[target["x_offset_m"], target["y_offset_m"], alt], initiate_landing=True)
+                    offset = [target["x_offset_m"], target["y_offset_m"]] if target is not None else self._last_landing_target_offset
+                    print(f"[STATE] Initiating Precision Landing on marker {self.landing_target_id} at offset ({offset[0]:+.2f}, {offset[1]:+.2f})m.")
+                    self._send("land_on_target", target=[offset[0], offset[1], alt], initiate_landing=True)
                 else:
                     print("[STATE] Failsafe / Timeout landing — commanding BRAKE -> LAND.")
                     self._send("set_mode", mode="BRAKE")
@@ -512,6 +516,7 @@ class MissionController:
             self._last_target_seen_time = time.time()
             x_off = target["x_offset_m"]
             y_off = target["y_offset_m"]
+            self._last_landing_target_offset = [x_off, y_off]
             alt = self._get_altitude()
 
             now = time.time()
