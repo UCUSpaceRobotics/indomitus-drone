@@ -93,7 +93,20 @@ class MissionController:
 
         # Flight parameters.
         self.takeoff_alt = config["flight"]["takeoff_altitude_m"]
+        self.origin_marker_id = config["markers"].get("origin_id", 101)
         self.landing_target_id = config["markers"]["landing_target_id"]
+
+        yaw_config = config.get("yaw_alignment", {})
+        self.yaw_alignment_tolerance_rad = math.radians(
+            float(yaw_config.get("tolerance_deg", 5.0))
+        )
+        self.yaw_alignment_confirmation_frames = int(
+            yaw_config.get("confirmation_frames", 3)
+        )
+        if self.yaw_alignment_tolerance_rad <= 0.0:
+            raise ValueError("yaw_alignment.tolerance_deg must be positive")
+        if self.yaw_alignment_confirmation_frames <= 0:
+            raise ValueError("yaw_alignment.confirmation_frames must be positive")
 
         # Latest telemetry snapshot (refreshed every tick).
         self.telem: dict = {}
@@ -119,6 +132,10 @@ class MissionController:
         # Target tracking: timestamp and last known offset of marker sighting.
         self._last_target_seen_time = 0.0
         self._last_landing_target_offset = [0.0, 0.0]
+
+        # Takeoff-marker yaw diagnostic tracking.
+        self._last_yaw_test_detection_seq = -1
+        self._last_yaw_test_log_time = 0.0
 
         # Landing target message rate limiting & cutoff during descent.
         self._last_landing_target_send_time = 0.0
@@ -506,11 +523,29 @@ class MissionController:
         """
         target = self.vision.get_latest_target()
 
-        if target is not None and target["marker_id"] == self.landing_target_id:
+        if target is None:
+            return
+
+        if target["marker_id"] == self.origin_marker_id:
+            detection_seq = target["detection_seq"]
+            if detection_seq != self._last_yaw_test_detection_seq:
+                self._last_yaw_test_detection_seq = detection_seq
+                now = time.time()
+                if now - self._last_yaw_test_log_time >= 0.5:
+                    yaw_error_deg = math.degrees(
+                        self._takeoff_marker_yaw_error_rad(target["rvec"])
+                    )
+                    print(
+                        f"[YAW TEST] Takeoff marker relative yaw: "
+                        f"{yaw_error_deg:+.1f} deg"
+                    )
+                    self._last_yaw_test_log_time = now
+            return
+
+        if target["marker_id"] == self.landing_target_id:
             self._last_target_seen_time = time.time()
-            x_off = target["x_offset_m"]
-            y_off = target["y_offset_m"]
-            self._last_landing_target_offset = [x_off, y_off]
+            tx, ty, _tz = target["tvec"]
+            self._last_landing_target_offset = [tx, ty]
             alt = self._get_altitude()
 
             now = time.time()
@@ -519,11 +554,11 @@ class MissionController:
                 # Above cutoff: throttle updates to 5 Hz to prevent rapid oscillation.
                 if alt > self.LANDING_TARGET_MIN_ALT_M:
                     if now - self._last_landing_target_send_time >= self.LANDING_TARGET_SEND_INTERVAL_S:
-                        self._send("send_landing_target", target=[x_off, y_off, alt])
+                        self._send("send_landing_target", target=[tx, ty, alt])
                         self._last_landing_target_send_time = now
             elif self.state == FlightState.SEARCH:
                 # During SEARCH: pre-warm target position stream
-                self._send("send_landing_target", target=[x_off, y_off, alt])
+                self._send("send_landing_target", target=[tx, ty, alt])
                 self._last_landing_target_send_time = now
 
 
@@ -562,6 +597,53 @@ class MissionController:
     # ==================================================================
     # Internal helpers
     # ==================================================================
+
+    @staticmethod
+    def _takeoff_marker_yaw_error_rad(rvec) -> float:
+        """Return marker-top yaw relative to drone forward in BODY_FRD."""
+        rx, ry, rz = map(float, rvec)
+        angle = math.sqrt(rx * rx + ry * ry + rz * rz)
+
+        if angle < 1e-9:
+            rotation_camera_marker = (
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0),
+            )
+        else:
+            x, y, z = rx / angle, ry / angle, rz / angle
+            cosine = math.cos(angle)
+            sine = math.sin(angle)
+            one_minus_cosine = 1.0 - cosine
+            rotation_camera_marker = (
+                (
+                    cosine + x * x * one_minus_cosine,
+                    x * y * one_minus_cosine - z * sine,
+                    x * z * one_minus_cosine + y * sine,
+                ),
+                (
+                    y * x * one_minus_cosine + z * sine,
+                    cosine + y * y * one_minus_cosine,
+                    y * z * one_minus_cosine - x * sine,
+                ),
+                (
+                    z * x * one_minus_cosine - y * sine,
+                    z * y * one_minus_cosine + x * sine,
+                    cosine + z * z * one_minus_cosine,
+                ),
+            )
+
+        marker_top_camera = (
+            rotation_camera_marker[0][1],
+            rotation_camera_marker[1][1],
+            rotation_camera_marker[2][1],
+        )
+        marker_top_body = (
+            marker_top_camera[1],
+            -marker_top_camera[0],
+            marker_top_camera[2],
+        )
+        return math.atan2(marker_top_body[1], marker_top_body[0])
 
     def _transition_to(self, new_state: FlightState):
         """Change state and reset per-state tracking variables."""

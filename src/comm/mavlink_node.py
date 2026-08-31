@@ -148,6 +148,7 @@ def dispatch_command(client, cmd, telem):
             dx_m=cmd.get("dx", 0.0),
             dy_m=cmd.get("dy", 0.0),
             dz_m=cmd.get("dz", 0.0),
+            yaw_rad=cmd.get("yaw_rad"),
         )
 
     elif action == "set_local_position":

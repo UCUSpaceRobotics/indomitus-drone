@@ -11,6 +11,10 @@ flight:
   max_horizontal_speed_m_s: 0.5
   max_vertical_speed_m_s: 0.3
 
+yaw_alignment:
+  tolerance_deg: 5.0
+  confirmation_frames: 3
+
 markers:
   origin_id: 101                 # ArUco ID for takeoff pad (15x15 cm)
   landing_target_id: 102         # ArUco ID for landing disc (15x15 cm)

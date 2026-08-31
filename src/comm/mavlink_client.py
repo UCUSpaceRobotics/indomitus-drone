@@ -365,7 +365,7 @@ class PixhawkClient:
         )
         print("[COMM] Command sent: OPPORTUNISTIC PRECISION LAND")
 
-    def send_position_target_local_ned(self, dx_m, dy_m, dz_m):
+    def send_position_target_local_ned(self, dx_m, dy_m, dz_m, yaw_rad=None):
         """
         Moves the drone relative to its CURRENT position and heading.
 
@@ -373,7 +373,13 @@ class PixhawkClient:
         dx_m: Move Forward (positive) or Backward (negative) in meters.
         dy_m: Move Right (positive) or Left (negative) in meters.
         dz_m: Move DOWN (positive) or UP (negative) in meters.
+        yaw_rad: Optional yaw change relative to the current body heading.
         """
+        if yaw_rad is not None:
+            yaw_rad = float(yaw_rad)
+            if not math.isfinite(yaw_rad):
+                raise ValueError("Relative yaw must be finite")
+
         type_mask = (
             (1 << 3)   # Ignore velocity X
             | (1 << 4) # Ignore velocity Y
@@ -381,10 +387,12 @@ class PixhawkClient:
             | (1 << 6) # Ignore acceleration X
             | (1 << 7) # Ignore acceleration Y
             | (1 << 8) # Ignore acceleration Z
-            | (1 << 10) # Ignore yaw angle
-            # Bit 11 is NOT set:
-            # yaw_rate is active and equals 0 rad/s
         )
+        if yaw_rad is None:
+            type_mask |= (1 << 10)  # Ignore yaw angle; active zero yaw rate holds heading.
+            yaw_rad = 0.0
+        else:
+            type_mask |= (1 << 11)  # Use yaw angle; ignore yaw rate.
 
         self.connection.mav.set_position_target_local_ned_send(
             0,  # time_boot_ms (not used)
@@ -401,10 +409,13 @@ class PixhawkClient:
             0.0,
             0.0,
             0.0,  # Acceleration (Ignored)
-            0.0,  # Yaw ignored
-            0.0,  # Active yaw rate: hold 0 rad/s
+            yaw_rad,
+            0.0,
         )
-        print(f"[COMM] Command sent: MOVE Local [dx:{dx_m}, dy:{dy_m}, dz:{dz_m}]")
+        print(
+            f"[COMM] Command sent: MOVE Local [dx:{dx_m}, dy:{dy_m}, dz:{dz_m}, "
+            f"yaw:{yaw_rad}]"
+        )
 
     def send_local_ned_position_target(self, x_m, y_m, z_m, log=True):
         """
