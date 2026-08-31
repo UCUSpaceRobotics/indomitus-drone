@@ -35,13 +35,15 @@ serial:
 
 ros2:
   vision_topic: /erc/vision_targets
+  mission_state_topic: /erc/mission_state
+  telemetry_topic: /erc/drone_telemetry
   domain_id: 27
 
 timeouts:
-  takeoff_s: 15.0
+  takeoff_s: 30.0
   search_sweep_s: 320.0
   alignment_s: 10.0
-  landing_s: 15.0
+  landing_s: 30.0
 
 led:
   enabled: true

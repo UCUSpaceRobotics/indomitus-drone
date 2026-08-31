@@ -26,6 +26,14 @@ import time
 
 import yaml
 
+from src.comm.mavlink_node import comm_process_loop
+from src.ros_bridge.vision_subscriber import VisionBridge
+from src.navigation.state_machine import MissionController, FlightState
+from src.comm.mavlink_node import create_command
+from src.utils.led_indicator import LEDController
+
+
+
 
 def load_config(path: str = "config/mission_params.yaml") -> dict:
     """Load and return the mission configuration from YAML."""
@@ -93,7 +101,6 @@ def main():
     # ------------------------------------------------------------------
     # 5. Start the MAVLink communication process
     # ------------------------------------------------------------------
-    from src.comm.mavlink_node import comm_process_loop
 
     comm_process = multiprocessing.Process(
         target=comm_process_loop,
@@ -118,25 +125,22 @@ def main():
     # ------------------------------------------------------------------
     # 7. Initialize LED Indicator
     # ------------------------------------------------------------------
-    from src.utils.led_indicator import LEDController
-
     led = LEDController(config.get("led", {}))
 
     # ------------------------------------------------------------------
     # 8. Create the VisionBridge (ROS 2 subscriber)
     # ------------------------------------------------------------------
-    from src.ros_bridge.vision_subscriber import VisionBridge
-
     vision = VisionBridge(
         topic=config["ros2"]["vision_topic"],
+        state_topic=config["ros2"].get("mission_state_topic", "/erc/mission_state"),
+        telemetry_topic=config["ros2"].get("telemetry_topic", "/erc/drone_telemetry"),
         grid_config=config["grid"],
     )
-    print("[MAIN] VisionBridge created — subscribed to vision topic.")
+    print("[MAIN] VisionBridge created — subscribed to vision & state topics, publishing telemetry.")
 
     # ------------------------------------------------------------------
     # 9. Create the MissionController (state machine)
     # ------------------------------------------------------------------
-    from src.navigation.state_machine import MissionController, FlightState
 
     mission = MissionController(
         command_queue=command_queue,
@@ -164,7 +168,6 @@ def main():
     except KeyboardInterrupt:
         print("\n[MAIN] === EMERGENCY STOP ===")
         print("[MAIN] Sending LAND command to Pixhawk...")
-        from src.comm.mavlink_node import create_command
         command_queue.put(create_command("set_mode", mode="LAND"))
         # Give the comm process a moment to send the command.
         time.sleep(1.0)

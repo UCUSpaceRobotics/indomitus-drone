@@ -30,27 +30,58 @@ import time
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, Pose
+from std_msgs.msg import Int32
 
 
 class DummyVisionPublisher(Node):
-    """Publishes simulated vision detections to /erc/vision_targets."""
+    """Publishes simulated vision detections to /erc/vision_targets and state to /erc/mission_state."""
 
-    def __init__(self, mode: str, topic: str = "/erc/vision_targets"):
+    def __init__(
+        self,
+        mode: str,
+        topic: str = "/erc/vision_targets",
+        state_topic: str = "/erc/mission_state",
+        telemetry_topic: str = "/erc/drone_telemetry",
+    ):
         super().__init__("dummy_vision_publisher")
         self.pub = self.create_publisher(Point, topic, 10)
+        self.state_pub = self.create_publisher(Int32, state_topic, 10)
+        self.telem_sub = self.create_subscription(
+            Pose, telemetry_topic, self._on_telemetry, 10
+        )
         self.timer = self.create_timer(0.1, self.tick)  # 10 Hz
         self.mode = mode
         self.t = 0.0
+        self.simulated_state = 0  # 0=IDLE, 1=TAKEOFF, 2=SEARCH, 3=DESCEND, 4=COMPLETE
         self.start_time = time.time()
         self.get_logger().info(
-            f"Publishing mode='{mode}' to {topic} at 10 Hz"
+            f"Publishing mode='{mode}' to {topic} and state to {state_topic} at 10 Hz"
         )
+
+    def _on_telemetry(self, msg: Pose):
+        """Echo received telemetry from Python."""
+        alt = msg.position.x
+        armed = msg.position.y > 0.5
+        ekf = msg.position.z > 0.5
+        dist = msg.orientation.x
+        # Simple auto-state simulation if running standalone:
+        if self.simulated_state == 0 and ekf:
+            self.simulated_state = 1
+        elif self.simulated_state == 1 and alt >= 1.275:
+            self.simulated_state = 2
+        elif self.simulated_state == 3 and alt < 0.25 and not armed:
+            self.simulated_state = 4
 
     def tick(self):
         """Called 10 times per second by the ROS 2 timer."""
         self.t += 0.1
         msg = Point()
+
+        # Publish simulated mission state
+        state_msg = Int32()
+        state_msg.data = int(self.simulated_state)
+        self.state_pub.publish(state_msg)
 
         if self.mode == "circle":
             msg = self._mode_circle()
