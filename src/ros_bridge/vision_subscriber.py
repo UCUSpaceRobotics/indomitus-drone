@@ -4,12 +4,8 @@ a clean API for the state machine.
 This module encapsulates all ROS 2 complexity. The state machine never
 imports rclpy directly — it only talks to VisionBridge.
 
-Message protocol on /erc/vision_targets (geometry_msgs/msg/Point):
-    z = 101.0  → Takeoff pad marker detected.  x, y = camera-frame offset (meters).
-    z = 102.0  → Landing target marker detected. x, y = camera-frame offset (meters).
-    z < 0      → Probe detected. x, y = estimated world position relative to
-                 takeoff pad (meters). |z| can encode probe ID.
-    z = 0.0    → No detection (heartbeat / empty frame).
+Message protocol on /erc/vision_targets (std_msgs/msg/Float64MultiArray):
+    data = [marker_id, tx, ty, tz, rx, ry, rz]
 
 Usage:
     rclpy.init()
@@ -19,7 +15,7 @@ Usage:
         bridge.spin_once()
         target = bridge.get_latest_target()
         if target is not None:
-            print(f"Marker {target['marker_id']} at offset ({target['x_offset_m']}, {target['y_offset_m']})")
+            print(f"Marker {target['marker_id']} tvec={target['tvec']} rvec={target['rvec']}")
 
     bridge.shutdown()
     rclpy.shutdown()
@@ -27,12 +23,13 @@ Usage:
 
 from __future__ import annotations
 
+import math
 import time
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Point, Pose, Quaternion
-from std_msgs.msg import Int32
+from std_msgs.msg import Int32, Float64MultiArray
 
 from src.utils.grid_mapper import GridMapper
 
@@ -58,7 +55,7 @@ class _VisionSubscriberNode(Node):
     ):
         super().__init__("vision_bridge")
         self.vision_sub = self.create_subscription(
-            Point, vision_topic, on_vision_callback, 10
+            Float64MultiArray, vision_topic, on_vision_callback, 10
         )
         self.state_sub = self.create_subscription(
             Int32, state_topic, on_state_callback, 10
@@ -101,9 +98,10 @@ class VisionBridge:
         self._grid_mapper = GridMapper(grid_config) if grid_config else None
 
         # Latest marker detection storage.
-        self._latest_marker_id: float = 0.0
-        self._latest_x: float = 0.0
-        self._latest_y: float = 0.0
+        self._latest_marker_id: int = 0
+        self._latest_tvec: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._latest_rvec: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._latest_detection_seq: int = 0
         self._last_detection_time: float = 0.0
 
         # Latest supervisory state from Simulink.
@@ -146,8 +144,9 @@ class VisionBridge:
         Returns:
             A dict with keys:
                 marker_id (int): 101 or 102.
-                x_offset_m (float): Horizontal offset from camera center (right = positive).
-                y_offset_m (float): Vertical offset from camera center (forward = positive).
+                tvec (tuple[float, float, float]): Target translation (tx, ty, tz).
+                rvec (tuple[float, float, float]): Target rotation vector (rx, ry, rz).
+                detection_seq (int): Sequence number of this valid marker detection.
                 age_s (float): Seconds since this detection was received.
             Returns None if no marker has been detected, or if the last
             detection is older than detection_timeout_s.
@@ -161,9 +160,10 @@ class VisionBridge:
             return None
 
         return {
-            "marker_id": int(self._latest_marker_id),
-            "x_offset_m": self._latest_x,
-            "y_offset_m": self._latest_y,
+            "marker_id": self._latest_marker_id,
+            "tvec": self._latest_tvec,
+            "rvec": self._latest_rvec,
+            "detection_seq": self._latest_detection_seq,
             "age_s": age,
         }
 
@@ -252,24 +252,49 @@ class VisionBridge:
         self._latest_simulink_state = int(msg.data)
         self._last_state_time = time.time()
 
-    def _on_vision_msg(self, msg: Point) -> None:
-        """Called by rclpy when a new Point message arrives.
+    def _on_vision_msg(self, msg: Float64MultiArray) -> None:
+        """Called by rclpy when a new Float64MultiArray message arrives.
 
-        Routing logic based on msg.z:
-            z = 101 or 102  → marker detection, store as latest target.
-            z < 0           → probe detection, map to grid sector.
-            z = 0           → no detection, ignore.
+        Expected data: [marker_id, tx, ty, tz, rx, ry, rz].
         """
         self._msg_count += 1
-        marker_id = msg.z
+
+        if len(msg.data) != 7:
+            self._node.get_logger().warning(
+                f"Ignoring malformed vision message: expected 7 values, got {len(msg.data)}"
+            )
+            return
+
+        try:
+            values = tuple(float(value) for value in msg.data)
+        except (TypeError, ValueError, OverflowError):
+            self._node.get_logger().warning(
+                "Ignoring malformed vision message: values must be numeric"
+            )
+            return
+
+        if not all(math.isfinite(value) for value in values):
+            self._node.get_logger().warning(
+                "Ignoring malformed vision message: values must be finite"
+            )
+            return
+
+        marker_id_value = values[0]
+        if not marker_id_value.is_integer():
+            self._node.get_logger().warning(
+                f"Ignoring malformed vision message: marker ID {marker_id_value} is not integral"
+            )
+            return
+
+        marker_id = int(marker_id_value)
+        tx, ty, tz, rx, ry, rz = values[1:]
 
         if marker_id in (MARKER_ID_ORIGIN, MARKER_ID_LANDING):
             # ArUco marker detection.
             self._latest_marker_id = marker_id
-            # Negate X: camera is mounted with X-axis inverted relative
-            # to the drone's right direction.
-            self._latest_x = msg.y
-            self._latest_y = -msg.x
+            self._latest_tvec = (tx, ty, tz)
+            self._latest_rvec = (rx, ry, rz)
+            self._latest_detection_seq += 1
             self._last_detection_time = time.time()
 
             # self._node.get_logger().info(
@@ -278,15 +303,15 @@ class VisionBridge:
             # )
 
         elif marker_id < 0:
-            # Probe detection. x, y are world position relative to takeoff pad.
+            # Probe detection. tx, ty are position relative to takeoff pad.
             if self._grid_mapper is not None:
-                sector = self._grid_mapper.position_to_sector(msg.y, msg.x)
+                sector = self._grid_mapper.position_to_sector(tx, ty)
                 if sector is not None:
                     if sector not in self._detected_probe_sectors:
                         self._node.get_logger().info(
                             f"New probe detected in sector {sector} "
-                            f"(position: x={msg.y:.2f}, y={msg.x:.2f})"
+                            f"(position: x={tx:.2f}, y={ty:.2f})"
                         )
                     self._detected_probe_sectors.add(sector)
 
-        # z == 0.0 → no detection, silently ignore.
+        # marker_id == 0 → no detection, silently ignore.
