@@ -74,10 +74,14 @@ def main() -> int:
             if target is None:
                 status += " marker=none"
             else:
+                tx, ty, tz = target["tvec"]
+                rx, ry, rz = target["rvec"]
                 status += (
                     f" marker={target['marker_id']}"
-                    f" forward={target['x_offset_m']:+.3f}m"
-                    f" right={target['y_offset_m']:+.3f}m"
+                    f" forward={tx:+.3f}m"
+                    f" right={ty:+.3f}m"
+                    f" down={tz:+.3f}m"
+                    f" rvec=({rx:+.3f},{ry:+.3f},{rz:+.3f})"
                     f" age={target['age_s']:.3f}s"
                 )
 
