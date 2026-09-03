@@ -139,7 +139,7 @@ class MissionController:
 
         # Landing target message rate limiting & cutoff during descent.
         self._last_landing_target_send_time = 0.0
-        self.LANDING_TARGET_SEND_INTERVAL_S = 0.2  # 5 Hz during descent (200ms)
+        self.LANDING_TARGET_SEND_INTERVAL_S = 1/15  # 15 Hz during descent (200ms)
         self.LANDING_TARGET_MIN_ALT_M = 0.5        # Stop sending corrections below 0.5m
 
         print("[STATE] MissionController initialized - single mission run.")
@@ -555,7 +555,7 @@ class MissionController:
             now = time.time()
             if self.state == FlightState.DESCEND:
                 # During DESCEND: stop corrections below cutoff altitude (commit to touchdown).
-                # Above cutoff: throttle updates to 5 Hz to prevent rapid oscillation.
+                # Above cutoff: throttle updates to 15 Hz to prevent rapid oscillation.
                 if alt > self.LANDING_TARGET_MIN_ALT_M:
                     if now - self._last_landing_target_send_time >= self.LANDING_TARGET_SEND_INTERVAL_S:
                         self._send("send_landing_target", target=[tx, ty, alt])

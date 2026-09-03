@@ -161,7 +161,7 @@ def main():
     try:
         while mission.state != FlightState.COMPLETE:
             mission.update()
-            time.sleep(0.02)  # 50 Hz — balances responsiveness and CPU usage.
+            time.sleep(1.0/50.0)  # 50 Hz — balances responsiveness and CPU usage.
     except ValueError as e:
         print(f"[MAIN] ERROR: {e}")
         print("[MAIN] Mission aborted due to error.")
