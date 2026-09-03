@@ -25,7 +25,7 @@ class PixhawkClient:
         # We set source_system=255 and source_component=0 to identify this RPi as a GCS
         # (Ground Control Station). This is crucial for the Pixhawk's failsafe logic.
         self.connection = mavutil.mavlink_connection(
-            connection_string, baud=baudrate, source_system=255, source_component=0
+            connection_string, baud=baudrate, source_system=254, source_component=0
         )
 
         # Internal state dictionary to hold the latest telemetry
