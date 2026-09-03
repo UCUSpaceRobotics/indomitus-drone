@@ -24,7 +24,7 @@ class PixhawkClient:
 
         # We set source_system=255 and source_component=0 to identify this RPi as a GCS
         # (Ground Control Station). This is crucial for the Pixhawk's failsafe logic.
-        self.connection = mavutil.mavlink_connection(
+        self.connection: mavutil.mavlink_connection = mavutil.mavlink_connection(
             connection_string, baud=baudrate, source_system=254, source_component=0
         )
 
@@ -138,6 +138,10 @@ class PixhawkClient:
             msg_type = msg.get_type()
 
             if msg_type == "HEARTBEAT":
+                # IGNORE heartbeats from Mission Planner / Ground Control Station!
+                if not self.connection.probably_vehicle_heartbeat(msg):
+                    continue
+
                 self.telemetry["last_heartbeat_time"] = time.time()
                 self.telemetry["armed"] = bool(
                     msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED

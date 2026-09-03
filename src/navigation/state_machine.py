@@ -291,6 +291,10 @@ class MissionController:
             return False
 
         mode = self.telem.get("mode", "UNKNOWN")
+        
+        # Ignore invalid/GCS mode strings rather than falsely triggering an override
+        if mode.startswith("Mode(") or mode == "UNKNOWN":
+            return False
 
         # 1. BRAKE is always an immediate abort in an enclosed competition area.
         if mode == "BRAKE" and self.state not in (FlightState.DESCEND, FlightState.COMPLETE):
