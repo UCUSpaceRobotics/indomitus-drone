@@ -145,6 +145,10 @@ class MissionController:
         print("[STATE] MissionController initialized - single mission run.")
         print(f"[STATE] Starting in {self.state.value}")
         self._update_led_indicator()
+        
+        self._mission_innitialized = False
+        
+        
 
     # ==================================================================
     # Public API
@@ -171,6 +175,9 @@ class MissionController:
         # Check if pilot intervened on RC or Pixhawk entered failsafe (e.g. Battery Failsafe LAND/RTL).
         if self._check_external_override_or_failsafe():
             self._publish_telemetry_to_simulink(manual_override=True)
+            return
+        if self._mission_innitialized == False:
+            self._publish_telemetry_to_simulink(manual_override=False)
             return
 
         # Safety: emergency land if drone drifts too far from origin.
@@ -291,6 +298,14 @@ class MissionController:
             return False
 
         mode = self.telem.get("mode", "UNKNOWN")
+        
+        if self._mission_innitialized == False:
+            if mode == "GUIDED":
+                self._mission_innitialized = True
+                print("[STATE] Mission initialized — Simulink commanded GUIDED mode.")
+            else:
+                print(f"[STATE] Waiting for Simulink to command GUIDED mode. Current mode: {mode}")
+                return False
         
         # Ignore invalid/GCS mode strings rather than falsely triggering an override
         if mode.startswith("Mode(") or mode == "UNKNOWN":
