@@ -64,7 +64,7 @@ sudo modprobe v4l2loopback video_nr=10,11 \
 
 setsid bash -c '
     rpicam-vid --width 640 --height 480 --framerate 15 \
-        --codec yuv420 --output - --timeout 0 | \
+        --codec yuv420 --output - --timeout 0 --shutter 16000 | \
     gst-launch-1.0 fdsrc ! \
         rawvideoparse width=640 height=480 format=i420 framerate=15/1 ! \
         videoconvert ! video/x-raw,format=YUY2 ! tee name=t \
