@@ -140,7 +140,7 @@ class MissionController:
         # Landing target message rate limiting & cutoff during descent.
         self._last_landing_target_send_time = 0.0
         self.LANDING_TARGET_SEND_INTERVAL_S = 1/15  # 15 Hz during descent (200ms)
-        self.LANDING_TARGET_MIN_ALT_M = 0.5        # Stop sending corrections below 0.5m
+        self.LANDING_TARGET_MIN_ALT_M = 0.25        # Stop sending corrections below 0.5m
 
         print("[STATE] MissionController initialized - single mission run.")
         print(f"[STATE] Starting in {self.state.value}")
@@ -396,7 +396,7 @@ class MissionController:
         x = self.telem.get("pos_x_m", 0.0)
         y = self.telem.get("pos_y_m", 0.0)
         origin_dist = math.sqrt(x ** 2 + y ** 2)
-        if origin_dist > 1.0:
+        if origin_dist > 5.0:
             self._log_throttled(
                 f"Waiting for origin to settle (current offset: {origin_dist:.2f}m > 1.0m)..."
             )
@@ -563,7 +563,7 @@ class MissionController:
 
         if target["marker_id"] == self.landing_target_id:
             self._last_target_seen_time = time.time()
-            tx, ty, _tz = target["tvec"]
+            tx, ty, tz = target["tvec"]
             self._last_landing_target_offset = [tx, ty]
             alt = self._get_altitude()
 
@@ -573,11 +573,11 @@ class MissionController:
                 # Above cutoff: throttle updates to 15 Hz to prevent rapid oscillation.
                 if alt > self.LANDING_TARGET_MIN_ALT_M:
                     if now - self._last_landing_target_send_time >= self.LANDING_TARGET_SEND_INTERVAL_S:
-                        self._send("send_landing_target", target=[tx, ty, alt])
+                        self._send("send_landing_target", target=[tx, ty, tz])
                         self._last_landing_target_send_time = now
             elif self.state == FlightState.SEARCH:
                 # During SEARCH: pre-warm target position stream
-                self._send("send_landing_target", target=[tx, ty, alt])
+                self._send("send_landing_target", target=[tx, ty, tz])
                 self._last_landing_target_send_time = now
 
 
