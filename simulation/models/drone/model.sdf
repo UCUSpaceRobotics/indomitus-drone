@@ -1,0 +1,216 @@
+<?xml version="1.0"?>
+<sdf version="1.9">
+  <model name="parrot_bebop_2">
+    <static>false</static>
+    <pose>0 0 0.062656 0 0 0</pose>
+
+    <plugin
+      filename="gz-sim-pose-publisher-system"
+      name="gz::sim::systems::PosePublisher">
+      <publish_link_pose>true</publish_link_pose>
+      <publish_sensor_pose>true</publish_sensor_pose>
+      <use_pose_vector_msg>true</use_pose_vector_msg>
+      <static_publisher>false</static_publisher>
+    </plugin>
+
+    <!-- Main link -->
+    <link name="body">
+      <inertial>
+        <mass>0.503</mass> <!-- kg -->
+        <inertia> <!-- kg.m^2 -->
+          <ixx>1.805e-3</ixx>
+          <ixy>-8.619e-7</ixy>
+          <iyy>1.764e-3</iyy>
+          <ixz>1.555e-5</ixz>
+          <iyz>3.595e-7</iyz>
+          <izz>3.328e-3</izz>
+        </inertia>
+        <pose>0 0 0 0 0 0</pose>
+      </inertial>
+      <collision name="collision">
+        <pose>-0.00424 0.00014 -0.00595 0 0 0</pose>
+        <geometry>
+          <box><size>0.316618 0.330564 0.089582</size></box>
+        </geometry>
+        <max_contacts>10</max_contacts>
+        <surface>
+          <bounce>
+            <restitution_coefficient>0.828</restitution_coefficient>
+            <threshold>0</threshold>
+          </bounce>
+          <friction>
+            <ode>
+              <mu>10</mu>
+              <mu2>5</mu2>
+              <fdir1>0 0 0</fdir1>
+              <slip1>0.0</slip1>
+              <slip2>0.0</slip2>
+            </ode>
+          </friction>
+          <contact>
+            <ode>
+              <kp>10000.0</kp>
+              <kd>10.0</kd>
+              <max_vel>0.01</max_vel>
+              <min_depth>0</min_depth>
+            </ode>
+          </contact>
+        </surface>
+      </collision>
+      <visual name="hull">
+        <geometry>
+          <mesh>
+            <uri>model://drone/meshes/hull.dae</uri>
+          </mesh>
+        </geometry>
+      </visual>
+      <visual name="propeller_rr">
+        <pose>-0.09035 -0.11423 -0.00501 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>model://drone/meshes/propeller_rr.dae</uri>
+          </mesh>
+        </geometry>
+      </visual>
+      <visual name="propeller_rl">
+        <pose>-0.09035 0.11452 -0.00501 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>model://drone/meshes/propeller_rl.dae</uri>
+          </mesh>
+        </geometry>
+      </visual>
+      <visual name="propeller_fr">
+        <pose>0.08456 -0.11435 -0.00501 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>model://drone/meshes/propeller_fr.dae</uri>
+          </mesh>
+        </geometry>
+      </visual>
+      <visual name="propeller_fl">
+        <pose>0.08456 0.11463 -0.00501 0 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>model://drone/meshes/propeller_fl.dae</uri>
+          </mesh>
+        </geometry>
+      </visual>
+    </link>
+
+    <!-- fpv camera -->
+    <link name="camera_link">
+      <pose>0.1 0 0 0 0 0</pose>
+      <inertial>
+        <mass>0.01</mass>
+        <inertia>
+          <ixx>0.00001</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00001</iyy>
+          <iyz>0</iyz>
+          <izz>0.00001</izz>
+        </inertia>
+      </inertial>
+      <sensor name="camera" type="camera">
+        <camera>
+          <horizontal_fov>1.047</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>480</height>
+          </image>
+          <clip>
+            <near>0.1</near>
+            <far>100</far>
+          </clip>
+        </camera>
+        <always_on>1</always_on>
+        <update_rate>30</update_rate>
+        <topic>camera</topic>
+        <gz_frame_id>parrot_bebop_2/camera_link</gz_frame_id>
+      </sensor>
+    </link>
+
+    <joint name="camera_joint" type="fixed">
+      <parent>body</parent>
+      <child>camera_link</child>
+    </joint>
+
+    <!-- Third-person view camera -->
+    <link name="camera2_link">
+      <pose degrees="true">-1.5 0 1 0 30 0</pose>
+      <inertial>
+        <mass>0.01</mass>
+        <inertia>
+          <ixx>0.00001</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00001</iyy>
+          <iyz>0</iyz>
+          <izz>0.00001</izz>
+        </inertia>
+      </inertial>
+      <sensor name="camera2" type="camera">
+        <camera>
+          <horizontal_fov>1.047</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>480</height>
+          </image>
+          <clip>
+            <near>0.1</near>
+            <far>100</far>
+          </clip>
+        </camera>
+        <always_on>1</always_on>
+        <update_rate>30</update_rate>
+        <topic>camera2</topic>
+        <gz_frame_id>parrot_bebop_2/camera2_link</gz_frame_id>
+      </sensor>
+    </link>
+
+    <joint name="camera2_joint" type="fixed">
+      <parent>body</parent>
+      <child>camera2_link</child>
+    </joint>
+
+    <!-- Camera down -->
+    <link name="camera_down_link">
+      <pose degrees="true">0 0 -0.02 0 90 0</pose>
+      <inertial>
+        <mass>0.01</mass>
+        <inertia>
+          <ixx>0.00001</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>0.00001</iyy>
+          <iyz>0</iyz>
+          <izz>0.00001</izz>
+        </inertia>
+      </inertial>
+      <sensor name="camera_down" type="camera">
+        <camera>
+          <horizontal_fov>1.047</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>480</height>
+          </image>
+          <clip>
+            <near>0.01</near>
+            <far>100</far>
+          </clip>
+        </camera>
+        <always_on>1</always_on>
+        <update_rate>30</update_rate>
+        <topic>camera_down</topic>
+        <gz_frame_id>parrot_bebop_2/camera_down_link</gz_frame_id>
+      </sensor>
+    </link>
+
+    <joint name="camera_down_joint" type="fixed">
+      <parent>body</parent>
+      <child>camera_down_link</child>
+    </joint>
+
+  </model>
+</sdf>

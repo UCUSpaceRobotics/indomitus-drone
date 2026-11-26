@@ -1,0 +1,27 @@
+name: simulation
+root: ./
+
+pre_window:
+startup_window: gz
+
+windows:
+  - gz:
+      panes:
+        - gz sim -v 4 -s -r worlds/$WORLD.world
+
+  - bridge:
+      panes:
+        - >
+          ros2 run ros_gz_bridge parameter_bridge
+          /camera@sensor_msgs/msg/Image@gz.msgs.Image
+          /camera2@sensor_msgs/msg/Image@gz.msgs.Image
+          /camera_down@sensor_msgs/msg/Image@gz.msgs.Image
+          /model/parrot_bebop_2/pose@tf2_msgs/msg/TFMessage@gz.msgs.Pose_V
+          --ros-args -r /model/parrot_bebop_2/pose:=/tf
+  
+  - foxglove:
+      panes:
+        - ros2 run foxglove_bridge foxglove_bridge
+
+  - mission:
+      panes:
