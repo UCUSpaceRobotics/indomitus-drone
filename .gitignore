@@ -16,12 +16,9 @@ env/
 # ============================================
 # ROS 2 / Colcon
 # ============================================
-# These are generated in ros2_ws, not in this repo,
-# but just in case someone builds inside the repo:
-build/
+# Generated in ~/ros2_ws, ignored here in case someone builds in-repo:
 install/
 log/
-*.pyc
 
 # ============================================
 # IDE & Editor
@@ -42,50 +39,35 @@ Thumbs.db
 desktop.ini
 
 # ============================================
-# Project-specific
+# Media, Logs & Raw Calibration Captures
 # ============================================
-# Recorded video/images (too large for git)
 recordings/
 *.mp4
 *.avi
 *.h264
 *.mjpeg
-
-# Logs
 logs/
+test_logs/
 *.log
-
-# Calibration images (raw captures — the .npz result IS tracked)
+# Raw checkerboard captures (compiled .npz results in config/ ARE tracked)
 calibration_images/
-matlab/slprj
-/matlab/erc_mission_node.slxc
 
-/matlab/erc_mission_node.tgz
-
-/matlab/erc_vision_node_sfun.mexa64
-
-/matlab/erc_vision_node.slx.original
-
-/matlab/erc_vision_node.slxc
-
-/matlab/erc_vision_node.zip
-
+# ============================================
+# MATLAB & Simulink Codegen / Build Artifacts
+# ============================================
+matlab/slprj/
+matlab/*_ert_rtw/
+matlab/erc_vision_node/
+matlab/erc_mission_node/
+matlab/src/
+*.slxc
+*.slx.autosave
+*.slx.original
+*.mex*
+matlab/*.tgz
+matlab/*.zip
 /matlab/math
-
 /matlab/merge.m
-
 /matlab/patchArucoCodegen.m
-
 /matlab/queue
-
 /matlab/time
-
-/matlab/slprj/
-
-/matlab/erc_mission_node_ert_rtw/
-
-/matlab/erc_vision_node/
-
-/matlab/erc_vision_node_ert_rtw/
-
-/matlab/src/
