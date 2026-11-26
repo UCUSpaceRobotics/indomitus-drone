@@ -1,6 +1,6 @@
 # Architecture — Indomitus Drone
 
-> This document is the single source of truth for the system architecture of the **Indomitus Drone** autonomous quadcopter, built for the **European Rover Challenge (ERC) 2026 — Droning Sub-Task**. It is designed to provide complete context for any developer or AI assistant working on this codebase.
+> This document is the single source of truth for the system architecture of the **Indomitus Drone** autonomous quadcopter, built for the **European Rover Challenge (ERC) 2026 — Droning Sub-Task**. It provides complete, up-to-date context on the hardware, Simulink ROS 2 nodes, Python execution bridge, and flight stack.
 
 ---
 
@@ -9,17 +9,16 @@
 1. [Mission Context](#1-mission-context)
 2. [Hardware Stack](#2-hardware-stack)
 3. [System Architecture Overview](#3-system-architecture-overview)
-4. [Layer 1 — The Eyes (Simulink C++ ROS 2 Node)](#4-layer-1--the-eyes-simulink-c-ros-2-node)
-5. [Layer 2 — The Brain (Python State Machine)](#5-layer-2--the-brain-python-state-machine)
-6. [Layer 3 — The Muscle (Pixhawk Flight Controller)](#6-layer-3--the-muscle-pixhawk-flight-controller)
-7. [Communication Protocols](#7-communication-protocols)
-8. [State Machine Design](#8-state-machine-design)
+4. [Layer 1 — Simulink C++ ROS 2 Nodes (Vision & Mission Supervisor)](#4-layer-1--simulink-c-ros-2-nodes-vision--mission-supervisor)
+5. [Layer 2 — Python Execution Bridge & MAVLink Driver](#5-layer-2--python-execution-bridge--mavlink-driver)
+6. [Layer 3 — Pixhawk Flight Controller (ArduCopter)](#6-layer-3--pixhawk-flight-controller-arducopter)
+7. [Communication Protocols & ROS 2 Topics](#7-communication-protocols--ros-2-topics)
+8. [Mission State Machine & Flight Behavior](#8-mission-state-machine--flight-behavior)
 9. [Coordinate Systems & Frames of Reference](#9-coordinate-systems--frames-of-reference)
 10. [Repository File Map](#10-repository-file-map)
 11. [External Dependencies & Filesystem Layout](#11-external-dependencies--filesystem-layout)
 12. [Startup & Deployment Sequence](#12-startup--deployment-sequence)
 13. [Configuration Reference](#13-configuration-reference)
-14. [Implementation Status & TODO](#14-implementation-status--todo)
 
 ---
 
@@ -27,42 +26,37 @@
 
 ### 1.1 Competition Rules
 
-The ERC Droning Sub-Task takes place inside a **10 × 10 × 4 m enclosed cage**. The drone must operate **fully autonomously** — any manual intervention during flight is penalized.
+The ERC Droning Sub-Task takes place inside a **10 × 10 × 4 m enclosed cage** (or outdoor netted arena). The drone must operate **fully autonomously** during each flight attempt — manual intervention during autonomous execution aborts scoring for that attempt.
 
-**Core mission (repeated 3 times):**
-1. Lift off from a 1 × 1 m takeoff pad marked with **ArUco ID 101** (15 × 15 cm, ArUco Original dictionary).
-2. Search for a landing disc (radius 0.5 m) randomly placed within 3 m of the takeoff pad, marked with **ArUco ID 102** (15 × 15 cm).
+**Core mission (3 separate single-run attempts):**
+1. Lift off from a 1 × 1 m takeoff pad marked with **ArUco ID 101** (15 × 15 cm, `DICT_ARUCO_ORIGINAL`).
+2. Search for a landing disc (radius 0.5 m) placed within 3 m of the takeoff pad, marked with **ArUco ID 102** (15 × 15 cm).
 3. Precision land on the disc. Landing is successful if any part of the drone touches the disc.
-4. After landing, the drone is **manually repositioned** back to the takeoff pad for the next attempt.
+4. After touchdown and disarm, the program exits (`COMPLETE`). The drone is **manually repositioned** back to the takeoff pad, and the mission script is restarted for the next attempt.
 
 **Additional scoring — Probe Detection:**
-- 3 probes are scattered within the 3 m radius area.
-- The system must detect them and report their positions using a 1 × 1 m alphanumeric grid (e.g., sector "A2" covers coordinates 0–0.5 m to 0.5–1.0 m).
-- 5 points per probe per mission (max 45 points across 3 missions).
-- Probe positions remain fixed across all 3 missions, but detections are scored per-mission.
+- Up to 3 probes are scattered within the 3 m radius area.
+- Detected world positions relative to the takeoff pad can be mapped to a 1 × 1 m alphanumeric grid (columns `A–F`, rows `1–6`, e.g., `"A2"`).
 
 **Additional scoring — Custom Landing Platform:**
-- Teams can prepare their own landing target (within 0.5 m radius disc) attachable to their rover.
-- 15 points for preparing it + 15 points per successful landing on it (max 45 points).
-- The custom platform does NOT have to use an ArUco marker.
+- Teams may prepare their own landing target (within a 0.5 m radius disc) attachable to their rover.
 
 ### 1.2 Time Constraints
 
 | Phase | Duration |
 |-------|----------|
 | Preparation (outside cage) | 15 minutes |
-| Mission execution | 30 minutes |
-| Total available for 3 takeoff-search-land cycles | 30 minutes |
+| Mission execution (all 3 takeoff–search–land runs) | 30 minutes |
 
 ### 1.3 Preflight Safety Requirements
 
-The jury will verify these before flight:
+Verified by the jury before flight:
 - Real-time telemetry + video feed to the operator.
-- Instant switch to manual/remote control on demand.
-- Automatic mid-air stability holding (LOITER mode).
-- Automatic landing on demand.
-- Failsafe for: RC loss, GCS loss, battery low, positioning glitch.
-- Polygon inclusion geofence configured for the cage dimensions.
+- Hardware **status LED indicator** clearly distinguishing manual standby (blinking Green) from autonomous flight (blinking Red).
+- Instant switch to manual/remote control on demand (pilot RC mode toggle immediately disengages Python/Simulink autonomy).
+- Automatic mid-air stability holding (`LOITER` mode) and automatic landing on demand (`LAND` / `BRAKE`).
+- Failsafes for RC loss, GCS heartbeat loss, low battery, EKF glitch, and arena drift.
+- Inclusion geofence configured in Mission Planner (the sole reason an onboard GPS receiver is installed) plus an 8 m local-origin software geofence.
 
 ---
 
@@ -77,634 +71,376 @@ The jury will verify these before flight:
 | Propellers | 1045R (10 × 4.5) |
 | Battery | 4S LiPo |
 
-### 2.2 Computing
+### 2.2 Computing & Status Indication
 
 | Component | Role | Connection |
 |-----------|------|------------|
 | **Pixhawk 6C** | Low-level flight controller (ArduCopter firmware) | — |
-| **Raspberry Pi 5** (16 GB) | Companion computer — vision, state machine, autonomy | UART to Pixhawk |
-| **5V 5A UBEC** | Powers the Pi from the LiPo | — |
+| **Raspberry Pi 5** (16 GB) | Companion computer — runs Simulink C++ ROS 2 nodes, camera pipeline, web HUD, and Python bridge | UART (`/dev/ttyAMA0`) to Pixhawk; Composite Video to VTX switcher |
+| **5V 5A UBEC** | Powers the Raspberry Pi 5 from the 4S LiPo | — |
+| **WS2812 5050 RGB LED Module** (7 LEDs) | Safety autonomy status indicator (Green blink = Manual/Standby, Red blink = Autonomous) | Raspberry Pi 5 Hardware SPI MOSI (`GPIO 10` / Physical Pin 19, `/dev/spidev0.0`) |
 
 ### 2.3 Sensors
 
 | Sensor | Direction | Connection | Purpose |
 |--------|-----------|------------|---------|
-| Arducam IMX708 12MP HDR 120° | Downward | Pi CSI (ribbon cable) | ArUco/probe detection |
-| Foxeer Cat 4 FPV | Forward | VTX only (NOT connected to Pi) | Pilot's view |
-| Microair MTF-01 | Downward | Pixhawk serial | Optical flow for GPS-denied flight |
-| Holybro M10 | Upward | Pixhawk I2C/serial | GPS + compass |
-| Pixhawk IMU | Internal | Onboard | Accelerometer + gyroscope |
+| **Arducam IMX708** (12MP HDR 120°) | Downward | Pi CSI ribbon cable | Computer vision (ArUco 101/102 detection & pose estimation; currently run in **cropped `640 × 480`** mode — see note below) |
+| **Foxeer Cat 4 FPV** | Forward | **3-ch Video Switcher / VTX ONLY** (NOT connected to Pi or Pixhawk) | Human pilot's forward FPV view only — **cannot be used for CV** |
+| **Microair MTF-01** | Downward | Pixhawk serial | Optical flow + rangefinder for indoor / GPS-denied position hold & navigation |
+| **Holybro M10** | Upward | Pixhawk I2C/serial | **Used ONLY for the Mission Planner geofence** (and compass); NOT used for autonomous navigation |
+| **Pixhawk IMU** | Internal | Onboard | Accelerometer + gyroscope for EKF3 attitude/motion fusion |
+
+> [!IMPORTANT]
+> - **Cropped CV Camera Resolution (Small Effective FOV):** Although the Arducam IMX708 lens has a physical **120° wide-angle FOV** on its full `4608 × 2592` sensor, the current pipeline captures at **`640 × 480`** without forcing a full-sensor `libcamera` binning mode (and `camera_calibration.npz` was calibrated on a cropped `1280 × 720` mode with ~72.5° × 45.3° FOV). As a result, `rpicam-vid` uses a **center-cropped region of the sensor**, giving a much narrower ground footprint (~2 × 1.8 m at 2.2 m altitude) rather than the full 120° wide angle. This is why the drone currently flies a multi-waypoint search grid instead of seeing the entire arena from hover.
+> - **GPS Role:** The Holybro M10 GPS module is installed **strictly to satisfy the Mission Planner geofence requirement**. All local position estimates (`LOCAL_POSITION_NED`) used during autonomous flight rely on the **Microair MTF-01 optical flow + rangefinder** fused with the onboard IMU in EKF3.
 
 ### 2.4 Communication Links
 
 | Link | Hardware | Frequency | Protocol | Purpose |
 |------|----------|-----------|----------|---------|
-| RC Control | RadioMaster RP1 V2 | 2.4 GHz (ELRS) | ExpressLRS | Pilot manual override |
-| Telemetry | 3DR Radio V5 | 433 MHz | MAVLink | Ground station data |
-| Video | Race Ranger VTX | 5.8 GHz | Analog PAL/NTSC | FPV to pilot goggles/monitor |
-| Pi ↔ Pixhawk | Hardwired UART | N/A | MAVLink 2.0 | Companion computer commands |
+| RC Control | RadioMaster RP1 V2 | 2.4 GHz (ELRS) | ExpressLRS | Pilot manual control & instant autonomy override |
+| Telemetry | 3DR Radio V5 | 433 MHz | MAVLink | Mission Planner ground station telemetry & geofence |
+| Video (FPV / Pi UI) | Race Ranger VTX | 5.8 GHz | Analog PAL/NTSC | Live video to ground monitor / FPV goggles |
+| Pi ↔ Pixhawk | Hardwired UART | N/A | MAVLink 2.0 (`921600` baud) | Companion computer telemetry & flight commands |
 
-### 2.5 Video Switching
+### 2.5 Video Switching & Ground UI Access via VTX
 
-A **3-channel video switcher** toggles the VTX feed between:
-1. Forward Foxeer Cat 4 camera (pilot view).
-2. Raspberry Pi composite output (can show Pi desktop or downward camera feed via script).
+A **3-channel video switcher** feeds the 5.8 GHz Race Ranger VTX and lets the operator toggle live between:
+1. **Forward Foxeer Cat 4 FPV camera:** Completely isolated from both the Raspberry Pi 5 and Pixhawk 6C. Used exclusively by the safety pilot for manual FPV flying; unavailable to any software or CV pipeline.
+2. **Raspberry Pi 5 composite video output:** Transmits the live **Raspberry Pi desktop UI** directly to the ground station screen over the analog VTX link. This provides a zero-network fallback in the field — by simply plugging a wireless/USB mouse into the Raspberry Pi, the operator can view the desktop via VTX to switch Wi-Fi/hotspot connections, inspect logs, or launch the autonomous mission directly without needing SSH.
 
-The VTX is completely isolated from the Pixhawk — there is **no OSD overlay**.
+The VTX path is completely isolated from the Pixhawk — there is **no OSD overlay**. When Wi-Fi is connected, operators can also view the downward CV camera + live target overlay in a browser via `scripts/vision_web_streamer.py` (`http://<pi-ip>:5000`).
 
 ---
 
 ## 3. System Architecture Overview
 
-The system operates as three sequential layers, each running as an independent process:
+To satisfy the ERC requirement that both **computer vision** and **high-level mission decision-making** run in **MATLAB/Simulink**, the companion computer runs **two compiled Simulink C++ ROS 2 nodes** alongside a **Python execution & hardware bridge**:
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        RASPBERRY PI 5                                   │
-│                                                                         │
-│  ┌───────────────────────┐     ROS 2 DDS      ┌──────────────────────┐ │
-│  │  LAYER 1: THE EYES    │    (local topic)    │  LAYER 2: THE BRAIN  │ │
-│  │                       │                     │                      │ │
-│  │  Simulink C++ Node    │ ──────────────────► │  Python rclpy Node   │ │
-│  │  (ArUco + Probes)     │ /erc/vision_targets │  (State Machine)     │ │
-│  │                       │                     │                      │ │
-│  │  Reads: Arducam       │                     │  Reads: ROS 2 topic  │ │
-│  │  Publishes: coords    │                     │  Writes: MAVLink     │ │
-│  └───────────────────────┘                     └──────────┬───────────┘ │
-│                                                           │             │
-│                                                    UART Serial          │
-│                                                   /dev/ttyAMA0          │
-│                                                    921600 baud          │
-└────────────────────────────────────────────────────────────┼─────────────┘
-                                                            │
-                                                            ▼
-                                               ┌────────────────────────┐
-                                               │  LAYER 3: THE MUSCLE   │
-                                               │                        │
-                                               │  Pixhawk 6C            │
-                                               │  ArduCopter + EKF3     │
-                                               │                        │
-                                               │  Fuses: Optical flow   │
-                                               │         GPS + IMU      │
-                                               │  Outputs: Motor PWM    │
-                                               └────────────────────────┘
-```
-
-### Why This Architecture?
-
-The ERC rules require that image processing and high-level decision-making use **MATLAB/Simulink**. Rather than rewriting the entire flight stack in MATLAB, we compartmentalize:
-
-- **Simulink** handles what it's best at: optimized C++ computer vision, compiled and deployed as a standalone ROS 2 node.
-- **Python** handles what it's best at: flexible state machine logic, rapid iteration, and `pymavlink` integration that's already proven in flight tests.
-- **ROS 2** is the glue: a single topic (`/erc/vision_targets`) bridges the two worlds with zero coupling.
-
----
-
-## 4. Layer 1 — The Eyes (Simulink C++ ROS 2 Node)
-
-### What It Does
-
-- Ingests raw camera frames from the downward-facing Arducam IMX708 via **V4L2** (`/dev/video0`).
-- Runs ArUco marker detection for IDs 101 (takeoff pad) and 102 (landing target).
-- Runs probe detection (color-based or shape-based algorithm).
-- Calculates the **relative X/Y offset** of detected targets from the camera center, in meters.
-- Publishes detection results to the ROS 2 topic `/erc/vision_targets`.
-
-### Where It Lives
-
-This node does **NOT** live in this repository. It is:
-1. Designed visually in **Simulink** on the ground station laptop using the Computer Vision Toolbox and Raspberry Pi Blockset.
-2. Auto-compiled to C++ by **Simulink Coder**.
-3. Deployed over SSH to `~/ros2_ws/src/` on the Raspberry Pi.
-4. Built on the Pi using `colcon build`.
-5. Launched with `ros2 run <package_name> <node_name>`.
-
-### ROS 2 Topic Output
-
-**Topic:** `/erc/vision_targets`
-**Message Type:** `geometry_msgs/msg/Point`
-
-The `z` field encodes the detection type. The routing convention used by `VisionBridge`:
-
-| `z` value | Detection Type | `x` meaning | `y` meaning |
-|-----------|---------------|-------------|-------------|
-| `101.0` | Takeoff pad marker | Camera-frame horizontal offset (meters, right = +) | Camera-frame vertical offset (meters, forward = +) |
-| `102.0` | Landing target marker | Camera-frame horizontal offset (meters, right = +) | Camera-frame vertical offset (meters, forward = +) |
-| `< 0` (e.g. `-1.0`) | Probe detected | World X position relative to takeoff pad (meters, North) | World Y position relative to takeoff pad (meters, East) |
-| `0.0` | No detection / heartbeat | Ignored | Ignored |
-
----
-
-## 5. Layer 2 — The Brain (Python State Machine)
-
-### What It Does
-
-This is the core of this repository. It:
-1. Subscribes to `/erc/vision_targets` via `rclpy` to receive vision data from the Simulink node.
-2. Maintains a finite state machine that transitions through mission phases.
-3. Calculates flight setpoints (position or velocity targets) based on the current state and vision data.
-4. Sends MAVLink commands to the Pixhawk via UART using `pymavlink`.
-
-### Process Architecture
-
-The Python side runs as **two OS-level processes** communicating via `multiprocessing.Queue`:
-
-```
-┌──────────────────────────────────────────┐
-│           MAIN PROCESS                    │
-│                                           │
-│  ┌─────────────────────────────────────┐ │
-│  │  rclpy Subscriber                    │ │
-│  │  (vision_subscriber.py)              │ │
-│  │                                      │ │
-│  │  Receives: /erc/vision_targets       │ │
-│  │  Updates: shared state variables     │ │
-│  └──────────┬──────────────────────────┘ │
-│             │                             │
-│             ▼                             │
-│  ┌─────────────────────────────────────┐ │
-│  │  State Machine                       │ │
-│  │  (state_machine.py)                  │ │
-│  │                                      │ │
-│  │  Evaluates: current state + vision   │ │
-│  │  Produces: flight commands           │ │
-│  └──────────┬──────────────────────────┘ │
-│             │  command_queue.put(cmd)      │
-└─────────────┼────────────────────────────┘
-              │
-              ▼  multiprocessing.Queue
-┌──────────────────────────────────────────┐
-│         COMM PROCESS (daemon)             │
-│         (mavlink_node.py)                 │
-│                                           │
-│  - Reads command_queue                    │
-│  - Dispatches to mavlink_client.py        │
-│  - Reads telemetry from Pixhawk           │
-│  - Pushes telemetry to telemetry_queue    │
-│  - Sends GCS heartbeat at 1 Hz            │
-└──────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                                    RASPBERRY PI 5                                      │
+│                                                                                        │
+│  [Arducam IMX708]                                                                      │
+│         │ (rpicam-vid + GStreamer tee + v4l2loopback via start_vision.sh)              │
+│         ├───────────────────────────────► /dev/video11 ──► vision_web_streamer.py      │
+│         ▼                                                   (HTTP MJPEG HUD :5000)     │
+│    /dev/video10                                                                        │
+│         │                                                                              │
+│         ▼                                                                              │
+│  ┌──────────────────────────┐   /erc/vision_targets    ┌────────────────────────────┐  │
+│  │ SIMULINK NODE 1 (EYES)   │  (Float64MultiArray[7])  │ SIMULINK NODE 2 (BRAIN)    │  │
+│  │ erc_vision_node (15 Hz)  ├─────────────────────────►│ erc_mission_node (15 Hz)   │  │
+│  │                          │            │             │                            │  │
+│  │ Detects ArUco 101 & 102  │            │             │ Supervisory State Machine  │  │
+│  │ Outputs: marker_id,      │            │             │ States: 0..4 (Int32)       │  │
+│  │   tvec[1x3], rvec[1x3]   │            │             └──────▲──────────────┬──────┘  │
+│  └──────────────────────────┘            │                    │              │         │
+│                                          │     /erc/drone_telemetry   /erc/mission_state
+│                                          │     (geometry_msgs/Pose)   (std_msgs/Int32) │
+│                                          ▼                    │              ▼         │
+│                                ┌──────────────────────────────┴──────────────┐         │
+│                                │         PYTHON EXECUTION BRIDGE             │         │
+│                                │  main.py (50 Hz)                            │         │
+│                                │  - VisionBridge (rclpy pub/sub)             │         │
+│                                │  - MissionController (executes states,      │         │
+│                                │    48-step search rings, safety overrides)  │         │
+│                                │  - LEDController (SPI WS2812 Green/Red)     │         │
+│                                └──────────────────────┬──────────────────────┘         │
+│                                                       │ multiprocessing.Queue          │
+│                                ┌──────────────────────▼──────────────────────┐         │
+│                                │         MAVLINK COMM DAEMON                 │         │
+│                                │  mavlink_node.py + mavlink_client.py        │         │
+│                                └──────────────────────┬──────────────────────┘         │
+│                                                       │ UART /dev/ttyAMA0 @ 921600     │
+└───────────────────────────────────────────────────────┼────────────────────────────────┘
+                                                        ▼
+                                       ┌────────────────────────────────┐
+                                       │       PIXHAWK 6C (MUSCLE)      │
+                                       │  ArduCopter + EKF3             │
+                                       │  - Optical flow (MTF-01) + IMU │
+                                       │  - Built-in Precision Landing  │
+                                       │  - GPS (M10) -> Geofence ONLY  │
+                                       └────────────────────────────────┘
 ```
 
 ---
 
-## 6. Layer 3 — The Muscle (Pixhawk Flight Controller)
+## 4. Layer 1 — Simulink C++ ROS 2 Nodes (Vision & Mission Supervisor)
 
-### What It Does
+Both Simulink models are stored in [`matlab/`](../matlab/), auto-coded to C++ via **Simulink Coder / ROS Toolbox**, and built into `~/ros2_ws/` on the Raspberry Pi using [`matlab/build_ros2_model.sh`](../matlab/build_ros2_model.sh) (`colcon build`). All ROS 2 nodes communicate on **`ROS_DOMAIN_ID = 27`**.
 
-The Pixhawk 6C runs **ArduCopter** firmware and handles everything below the application level:
-- **EKF3 sensor fusion**: merges optical flow (MTF-01), GPS (Holybro M10), IMU, and compass data into a unified position/velocity/attitude estimate.
-- **PID control loops**: converts position/velocity setpoints into motor PWM signals.
-- **Failsafe management**: RC loss → RTL, GCS loss → LAND, battery low → LAND, EKF divergence → LAND.
-- **Flight modes**: GUIDED (accepts external setpoints), LOITER (hold position), LAND, RTL.
+### 4.1 Camera Loopback Pipeline (`scripts/start_vision.sh`)
 
-### What It Receives from the Pi
+Because Linux V4L2 allows only one process to open a hardware camera node exclusively, [`scripts/start_vision.sh`](../scripts/start_vision.sh) loads `v4l2loopback` and creates two virtual video devices fed by a single `rpicam-vid` + GStreamer `tee` pipeline (**center-cropped `640 × 480`** @ 15 FPS, 16 ms shutter — does not currently use the full 120° sensor area):
+- **`/dev/video10` (`SimulinkCam`):** Read by `erc_vision_node`.
+- **`/dev/video11` (`WebStreamCam`):** Read by [`scripts/vision_web_streamer.py`](../scripts/vision_web_streamer.py), which overlays live `VisionBridge` target vectors onto an MJPEG web stream at `http://<pi-ip>:5000`.
 
-MAVLink 2.0 messages over UART (`/dev/ttyAMA0` at 921600 baud):
+### 4.2 Node 1: `erc_vision_node` (`matlab/erc_vision_node.slx`)
 
-| MAVLink Message | Purpose |
-|-----------------|---------|
-| `HEARTBEAT` (GCS type) | Keeps GCS failsafe from triggering (sent at 1 Hz) |
-| `SET_MODE` | Changes flight mode (GUIDED, LOITER, LAND, RTL) |
-| `MAV_CMD_COMPONENT_ARM_DISARM` | Arms/disarms motors |
-| `MAV_CMD_NAV_TAKEOFF` | Commands liftoff to specified altitude |
-| `MAV_CMD_NAV_LAND` | Commands landing (with optional precision landing) |
-| `SET_POSITION_TARGET_LOCAL_NED` | Position or velocity setpoints in local NED frame |
-| `LANDING_TARGET` | Precision landing target position in BODY_FRD frame |
+**Role:** Real-time ArUco detection and 6-DoF pose estimation at **15 Hz**.
 
-### What It Sends to the Pi
+**How it works internally:**
+1. **V4L2 Video Capture block:** Reads planar `R`, `G`, `B` matrices (`640 × 480`) from `/dev/video10` every `1/15` s.
+2. **Calibration Parameters:** Loaded at build/init time from `config/camera_calibration.npz` via [`matlab/load_calibration_npz.m`](../matlab/load_calibration_npz.m), scaling `focalLength`, `principalPoint`, `radialDistortion`, and `tangentialDistortion` to `[480, 640]`.
+3. **MATLAB Function (`detectAndEstimate`):**
+   - Reconstructs the 3-channel RGB frame and builds a `cameraIntrinsics` object.
+   - Runs `readArucoMarker(frame, "DICT_ARUCO_ORIGINAL", intrinsics, 0.15)` for 15 cm markers.
+   - **Priority logic:** Searches detected IDs for landing target **`102`** first; falls back to takeoff pad **`101`** if `102` is not visible; ignores any other IDs. If nothing is detected, outputs all zeros (`marker_id = 0`).
+   - Computes the 3D translation vector and converts the 3×3 pose rotation matrix into a `1×3` rotation vector via `rotmat2vec3d`.
+   - Transforms lateral camera offsets directly into the drone's **`BODY_FRD`** coordinate convention (`tvec = [forward_m, right_m, down_m]`).
+4. **Vector Packing & ROS 2 Publish (`/erc/vision_targets`):**
+   - Simulink concatenates the **3 output variables** — `marker_id` (`1×1` scalar), `tvec` (`1×3` vector), and `rvec` (`1×3` vector) — into a single **length-7 `double` array**:
+     ```text
+     data = [marker_id, tx, ty, tz, rx, ry, rz]
+     ```
+   - Published on `/erc/vision_targets` as `std_msgs/msg/Float64MultiArray` (`CurrentLength = 7`).
 
-| MAVLink Message | Data |
-|-----------------|------|
-| `HEARTBEAT` | Armed state, flight mode |
-| `LOCAL_POSITION_NED` | X, Y, Z position in local NED (meters) |
-| `ATTITUDE` | Roll, pitch, yaw (radians) |
-| `SYS_STATUS` | Battery voltage, remaining percentage |
-| `EKF_STATUS_REPORT` | EKF health flags |
-| `RC_CHANNELS` | RC link status, RSSI, channel values |
-| `STATUSTEXT` | Human-readable messages (pre-arm checks, errors) |
-| `COMMAND_ACK` | Acknowledgment of received commands |
+### 4.3 Node 2: `erc_mission_node` (`matlab/erc_mission_node.slx`)
 
----
+**Role:** High-level supervisory finite state machine running at **15 Hz**. All autonomous mission state transitions originate from this node.
 
-## 7. Communication Protocols
-
-### 7.1 ROS 2 DDS (Layer 1 → Layer 2)
-
-- **Middleware:** FastDDS (default for ROS 2 Jazzy)
-- **Transport:** Shared memory (both nodes run on the same Pi)
-- **Domain ID:** Configured in `config/mission_params.yaml` (default: 42)
-- **QoS:** Default reliability (RELIABLE) with queue depth 10
-
-| Topic | Message Type | Publisher | Subscriber | Rate |
-|-------|-------------|-----------|------------|------|
-| `/erc/vision_targets` | `geometry_msgs/msg/Point` | Simulink C++ node | `vision_subscriber.py` | ~10–30 Hz |
-
-### 7.2 MAVLink 2.0 (Layer 2 → Layer 3)
-
-- **Physical:** UART serial, `/dev/ttyAMA0`
-- **Baud rate:** 921600
-- **Protocol:** MAVLink 2.0 (`MAVLINK20=1`)
-- **Source system/component:** 255/0 (identifies Pi as a GCS to ArduCopter)
-- **Target system/component:** Auto-detected via initial heartbeat handshake
-
-### 7.3 Inter-Process (within Layer 2)
-
-- **Mechanism:** `multiprocessing.Queue` (Python standard library)
-- **Queues:**
-  - `telemetry_queue`: Comm process → Main process. Carries telemetry dictionaries at 10 Hz. Old entries are flushed to ensure freshness.
-  - `command_queue`: Main process → Comm process. Carries timestamped command dictionaries. Commands older than 500 ms are dropped.
+**How it works internally:**
+1. **ROS 2 Subscriptions:**
+   - Subscribes to `/erc/drone_telemetry` (`geometry_msgs/msg/Pose` published by Python) and uses a `Bus Selector` to unpack 7 telemetry signals: `alt`, `is_armed`, `ekf_healthy`, `origin_dist`, `connected`, `manual_override`, and `waypoints_exhausted`.
+   - Subscribes to `/erc/vision_targets` (`std_msgs/msg/Float64MultiArray`) and uses a `Selector` block (index `1`) to extract `marker_id`.
+2. **MATLAB Function (`Mission_State_Supervisor`):**
+   - Maintains persistent state (`current_state`), per-state elapsed timer (`state_timer_s`), and a debounce counter for marker `102` (`detect_confirm_ticks`: increments by `+1` when `marker_id == 102`, decays by `-2` down to `0` when absent, requiring `15` ticks to confirm target lock).
+   - **Global safety checks:**
+     - If `manual_override > 0.5` → immediately transitions to `4` (`COMPLETE`) to disengage autonomy.
+     - If `origin_dist > 8.0` m → immediately transitions to `3` (`DESCEND`) to force emergency landing.
+   - **State transition guards:**
+     - `0` (`IDLE`) → `1` (`TAKEOFF`): when `connected`, `ekf_healthy`, and `origin_dist <= 6.0` m.
+     - `1` (`TAKEOFF`) → `2` (`SEARCH`): when `alt >= 0.85 * 1.5` m (`1.275` m); or → `3` (`DESCEND`) on 30 s timeout.
+     - `2` (`SEARCH`) → `3` (`DESCEND`): when marker `102` is confirmed (`detect_confirm_ticks >= 15`), or when `waypoints_exhausted` / 320 s search timeout expires.
+     - `3` (`DESCEND`) → `4` (`COMPLETE`): when touchdown is confirmed (`alt < 0.25` m and `is_armed == 0`) or after 30 s descent timeout once disarmed.
+3. **ROS 2 Publish (`/erc/mission_state`):**
+   - Transmits **a single number (`int32`)** — the current state ID (`0`, `1`, `2`, `3`, or `4`) — on `/erc/mission_state` (`std_msgs/msg/Int32`).
 
 ---
 
-## 8. State Machine Design
+## 5. Layer 2 — Python Execution Bridge & MAVLink Driver
 
-The autonomous mission follows this state progression:
+Python runs as **two OS-level processes** (plus a background LED thread) communicating via `multiprocessing.Queue`:
 
 ```
-                    ┌─────────┐
-                    │  IDLE   │
-                    └────┬────┘
-                         │ start_mission()
-                         ▼
-                    ┌─────────┐
-                    │ TAKEOFF │
-                    └────┬────┘
-                         │ altitude reached
-                         ▼
-                    ┌─────────┐◄──────────────────┐
-                    │ SEARCH  │                    │
-                    └────┬────┘                    │
-                         │ marker 102 detected     │
-                         ▼                         │
-                    ┌─────────┐                    │
-                    │  ALIGN  │                    │
-                    └────┬────┘                    │
-                         │ centered over target    │
-                         ▼                         │
-                    ┌─────────┐                    │
-                    │  LAND   │                    │
-                    └────┬────┘                    │
-                         │ touchdown confirmed     │
-                         ▼                         │
-                    ┌──────────┐    attempts < 3   │
-                    │ COMPLETE ├────────────────────┘
-                    └────┬─────┘
-                         │ attempts == 3
-                         ▼
-                    ┌──────────┐
-                    │ MISSION  │
-                    │  DONE    │
-                    └──────────┘
+┌──────────────────────────────────────────────────────────┐
+│                 MAIN PROCESS (main.py, 50 Hz)            │
+│                                                          │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │ VisionBridge (src/ros_bridge/vision_subscriber.py) │  │
+│  │  - Subscribes: /erc/vision_targets (7-float array) │  │
+│  │  - Subscribes: /erc/mission_state  (Int32 state)   │  │
+│  │  - Publishes:  /erc/drone_telemetry (Pose)         │  │
+│  └─────────────────────────┬──────────────────────────┘  │
+│                            ▼                             │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │ MissionController (src/navigation/state_machine.py)│  │
+│  │  - Follows Simulink state commands (0..4)          │  │
+│  │  - Executes takeoff sequence, 48-step search grid, │  │
+│  │    and 15 Hz LANDING_TARGET precision descent      │  │
+│  │  - Enforces 8m geofence & RC override safety       │  │
+│  └───────────┬────────────────────────────┬───────────┘  │
+│              │                            ▼              │
+│              │             ┌──────────────────────────┐  │
+│              │             │ LEDController (SPI thread)│  │
+│              │             │ Green=Manual, Red=Auto   │  │
+│              │             └──────────────────────────┘  │
+└──────────────┼───────────────────────────────────────────┘
+               │ command_queue / telemetry_queue
+               ▼
+┌──────────────────────────────────────────────────────────┐
+│           COMM PROCESS (src/comm/mavlink_node.py)        │
+│  - Sends GCS heartbeat at 1 Hz (source_system=254)       │
+│  - Reads Pixhawk UART telemetry -> telemetry_queue (10Hz)│
+│  - Validates (<500ms age + armed/mode guards) & sends    │
+│    MAVLink commands via PixhawkClient                    │
+└──────────────────────────────────────────────────────────┘
 ```
 
-### State Descriptions
+---
 
-| State | Entry Condition | Behavior | Exit Condition |
-|-------|----------------|----------|----------------|
-| **IDLE** | System startup | Wait for operator command. Arm checks. | `start_mission()` called |
-| **TAKEOFF** | Mission started | Set GUIDED mode, arm, send takeoff command. Monitor altitude. | Target altitude reached (within 90%) |
-| **SEARCH** | At search altitude | Execute sweep pattern within 3 m radius. Continuously check `/erc/vision_targets` for marker ID 102. Also detect and log probes. | Marker 102 detected |
-| **ALIGN** | Marker 102 visible | Reduce altitude. Send velocity/position corrections to center the drone over the marker. | Target centered within landing threshold |
-| **LAND** | Aligned over target | Send precision landing commands (`LANDING_TARGET` messages). Continuously update target position. | Drone touches down (altitude ≈ 0, disarmed or in LAND mode) |
-| **COMPLETE** | Landed | Log attempt. If attempts < 3, transition to IDLE (wait for manual reposition). | Manual trigger for next attempt, or 3 attempts done |
-| **MISSION_DONE** | 3 landings complete | Report probe detection results. Disarm. | — |
+## 6. Layer 3 — Pixhawk Flight Controller (ArduCopter)
 
-### Probe Detection (During SEARCH State)
+The Pixhawk 6C runs **ArduCopter** firmware and manages flight dynamics:
+- **EKF3 sensor fusion:** Fuses **Microair MTF-01 optical flow + rangefinder** and onboard IMU/compass into a local position/velocity/attitude estimate (`LOCAL_POSITION_NED`). *(Holybro M10 GPS is used strictly for the Mission Planner geofence, not indoor autonomy.)*
+- **Built-in Precision Landing (`PLND_ENABLED=1`, `PLND_TYPE=1`):** During `LAND` mode, ArduCopter consumes `LANDING_TARGET` messages (`MAV_FRAME_BODY_FRD`) sent by the Raspberry Pi and steers the drone directly onto ArUco marker 102 using its internal PID loops — eliminating the need for a custom outer-loop alignment controller in Python.
+- **Flight modes used:** `LOITER` (optical-flow arming & manual hold), `GUIDED` (autonomous takeoff & search waypoints), `LAND` (precision descent), `BRAKE` (emergency stop on geofence breach).
 
-While searching for marker 102, the system simultaneously:
-1. Detects probes in the camera feed (via Simulink node).
-2. Maps each probe's estimated (x, y) position to the 1 × 1 m grid sector.
-3. Accumulates detections across frames for confidence filtering.
-4. Reports final sector IDs (e.g., "A2", "C4") at mission end.
+### MAVLink Messages (Pi ↔ Pixhawk)
+
+| Direction | Message | Purpose |
+|-----------|---------|---------|
+| Pi → Pixhawk | `HEARTBEAT` (`source_system=254`) | 1 Hz companion heartbeat preventing GCS failsafe without colliding with Mission Planner (`255`) |
+| Pi → Pixhawk | `SET_MODE` | Switches between `LOITER`, `GUIDED`, `LAND`, `BRAKE` |
+| Pi → Pixhawk | `MAV_CMD_COMPONENT_ARM_DISARM` | Arms motors during takeoff sequence |
+| Pi → Pixhawk | `MAV_CMD_NAV_TAKEOFF` | Climbs to `flight.takeoff_altitude_m` |
+| Pi → Pixhawk | `MAV_CMD_NAV_LAND` | Initiates descent with precision landing active |
+| Pi → Pixhawk | `SET_POSITION_TARGET_LOCAL_NED` | Relative body-offset 1 m search moves (`MAV_FRAME_BODY_OFFSET_NED`) |
+| Pi → Pixhawk | `LANDING_TARGET` | Streams marker 102 `BODY_FRD` `[x, y, z]` coordinates (`LANDING_TARGET_TYPE_VISION_FIDUCIAL`) |
+| Pixhawk → Pi | `HEARTBEAT`, `LOCAL_POSITION_NED`, `ATTITUDE`, `SYS_STATUS`, `EKF_STATUS_REPORT`, `RC_CHANNELS`, `STATUSTEXT` | Telemetry at 10–20 Hz |
+
+---
+
+## 7. Communication Protocols & ROS 2 Topics
+
+### 7.1 ROS 2 DDS (`ROS_DOMAIN_ID = 27`)
+
+- **Middleware:** FastDDS (ROS 2 Jazzy on Debian Trixie arm64)
+- **Domain ID:** `27` (set in `config/mission_params.yaml`, `scripts/start_vision.sh`, and terminal launch commands)
+- **QoS:** `RELIABLE`, `KEEP_LAST`, depth `10`
+
+| Topic | Message Type | Publisher | Subscriber(s) | Payload Format |
+|-------|-------------|-----------|---------------|----------------|
+| `/erc/vision_targets` | `std_msgs/msg/Float64MultiArray` | `erc_vision_node` (15 Hz) | `VisionBridge`, `erc_mission_node`, `vision_web_streamer.py` | 7 floats: `[marker_id, tx, ty, tz, rx, ry, rz]` (`101`, `102`, `0` = none, `<0` = probe) |
+| `/erc/drone_telemetry` | `geometry_msgs/msg/Pose` | `VisionBridge` (50 Hz) | `erc_mission_node` | `position.{x: alt, y: armed, z: ekf_healthy}`, `orientation.{x: origin_dist, y: connected, z: manual_override, w: waypoints_exhausted}` |
+| `/erc/mission_state` | `std_msgs/msg/Int32` | `erc_mission_node` (15 Hz) | `VisionBridge` | Single integer state ID: `0=IDLE`, `1=TAKEOFF`, `2=SEARCH`, `3=DESCEND`, `4=COMPLETE` |
+
+### 7.2 MAVLink 2.0 & Multiprocessing Queues
+
+- **UART:** `/dev/ttyAMA0` @ `921600` baud (`MAVLINK20=1`, `source_system=254`, `source_component=0`).
+- **Command safety in `mavlink_node.py`:** Drops commands older than `500 ms` and blocks motion/landing commands if the drone is disarmed or not in `GUIDED` (except `send_landing_target` / `land_on_target`, which are permitted in `LAND` mode).
+
+---
+
+## 8. Mission State Machine & Flight Behavior
+
+Each invocation of `main.py` executes **a single mission attempt** supervised by `erc_mission_node`:
+
+```
+  ┌──────────┐   Pixhawk + EKF healthy   ┌──────────┐   alt >= 85% target   ┌──────────┐
+  │ 0: IDLE  ├──────────────────────────►│1: TAKEOFF├──────────────────────►│2: SEARCH │
+  └──────────┘   (+ pilot sets GUIDED)   └────┬─────┘                       └────┬─────┘
+                                              │ timeout (30s)                    │ marker 102 confirmed
+                                              ▼                                  │ (or sweep exhausted)
+                                         ┌──────────┐◄───────────────────────────┘
+                                         │3: DESCEND│
+                                         └────┬─────┘
+                                              │ alt < 0.25m & disarmed
+                                              ▼
+                                         ┌──────────┐
+                                         │4:COMPLETE│  (main.py exits cleanly)
+                                         └──────────┘
+```
+
+### Detailed Execution per Phase (`MissionController`)
+
+1. **Startup & Mode Gate:**
+   - `main.py` waits `startup.start_delay_s` (`8 s` stationary countdown) and `startup.pixhawk_init_delay_s` (`6 s` for heartbeat + EKF).
+   - `MissionController` stays gated (`_mission_innitialized = False`, LED blinking **Green**) until the operator switches the drone into `GUIDED` mode, preventing accidental motion on boot.
+2. **`0: IDLE`:** Verifies Pixhawk heartbeat, EKF3 health flags, and local origin stability while streaming telemetry to Simulink.
+3. **`1: TAKEOFF`:** Executes a 5-step arming & liftoff sequence: `LOITER` → wait 2 s → `ARM` (with 5 s retry) → `GUIDED` → wait 1 s → `takeoff(takeoff_altitude_m)`. LED switches to blinking **Red**.
+4. **`2: SEARCH`:**
+   - Hovers 3 s at center to stabilize, then flies a pre-computed **48-move expanding-ring serpentine pattern** covering a 7 × 7 m grid around the origin in 1 m body-frame steps (`Ring 1: 3×3`, `Ring 2: 5×5`, `Ring 3: 7×7`; 4 s travel + 3 s scan dwell per waypoint).
+   - Whenever marker `102` is seen during `SEARCH`, Python immediately pre-warms ArduPilot's precision landing estimator with `send_landing_target([tx, ty, tz])`.
+5. **`3: DESCEND`:**
+   - Sends `MAV_CMD_NAV_LAND` on entry.
+   - Streams `LANDING_TARGET` (`BODY_FRD`) updates throttled to **15 Hz** while above **`0.25 m`** altitude; below `0.25 m`, target updates stop so the drone commits cleanly to touchdown without close-range camera oscillation.
+   - Supports recovery back to `SEARCH` (`GUIDED` + climb) if commanded by Simulink.
+6. **`4: COMPLETE` (or Safety Override):**
+   - Entered upon touchdown + disarm, or immediately if the pilot switches RC flight mode out of `GUIDED`/`LAND` (manual takeover). LED returns to **Green**, and `main.py` shuts down cleanly.
+   - **8 m Software Geofence:** If horizontal distance from origin exceeds `8.0 m` in flight, Python immediately commands `BRAKE` → `LAND` and forces `DESCEND`.
 
 ---
 
 ## 9. Coordinate Systems & Frames of Reference
 
-### 9.1 Local NED (Pixhawk / ArduCopter)
-
-Used by `LOCAL_POSITION_NED` and `SET_POSITION_TARGET_LOCAL_NED`:
-- **Origin:** Where the drone was when EKF initialized (typically the takeoff pad).
-- **X:** North (forward from initial heading) — positive forward.
-- **Y:** East — positive right.
-- **Z:** Down — **negative values mean UP**.
-- Example: position `(0, 0, -2.0)` means "above the origin at 2 m altitude."
-
-### 9.2 Body NED / Body FRD (Drone-Relative)
-
-Used by velocity commands and `LANDING_TARGET`:
-- **X / Forward:** Positive in the direction the drone is facing.
-- **Y / Right:** Positive to the right of the drone's heading.
-- **Z / Down:** Positive downward.
-- Example: `LANDING_TARGET(x=0.2, y=-0.1, z=2.5)` means "marker is 20 cm forward, 10 cm left, 2.5 m below the drone."
-
-### 9.3 Camera Frame (Simulink Output)
-
-The Simulink vision node outputs offsets relative to the **camera center**:
-- **X:** Horizontal pixel offset converted to meters (positive = target is to the right of center).
-- **Y:** Vertical pixel offset converted to meters (positive = target is ahead/above center in the image).
-- Conversion from pixels to meters uses the camera intrinsic matrix from `config/camera_calibration.npz` and the estimated altitude.
-
-### 9.4 Competition Grid
-
-For probe detection reporting:
-- The 6 × 6 m competition area is divided into 1 × 1 m sectors.
-- Columns labeled A–F (left to right).
-- Rows labeled 1–6 (front to back).
-- Grid origin and mapping are defined in `config/mission_params.yaml`.
+1. **Local NED (`LOCAL_POSITION_NED`):** Origin initialized where EKF3 boots (takeoff pad). `+X` = North/Forward, `+Y` = East/Right, `+Z` = Down (`pos_z_m` is negative above ground; `_get_altitude()` negates it).
+2. **Body FRD (`MAV_FRAME_BODY_FRD` & `erc_vision_node` `tvec`):** Drone-relative frame used by `LANDING_TARGET` and output directly by `erc_vision_node`:
+   - `tx` (`+X`): Forward from camera/drone center (meters).
+   - `ty` (`+Y`): Right of camera/drone center (meters).
+   - `tz` (`+Z`): Downward distance to the marker below the drone (meters, must be `> 0`).
+3. **Competition Probe Grid (`GridMapper`):** Maps `(x_m, y_m)` local NED offsets from takeoff pad to 1 × 1 m sectors `A1–F6` using `grid.origin_x_m` and `grid.origin_y_m` in `config/mission_params.yaml`.
 
 ---
 
 ## 10. Repository File Map
 
-Every file in this repository, its purpose, and key implementation details.
-
-### Root Files
-
-#### `main.py` \u2705 IMPLEMENTED
-**Role:** Application entry point. Orchestrates all processes.
-
-**Startup sequence (executed once):**
-1. Loads `config/mission_params.yaml` with PyYAML.
-2. Initializes ROS 2 (`rclpy.init()`). Gracefully exits if `rclpy` is not importable (ROS 2 env not sourced).
-3. Creates `multiprocessing.Queue` instances for telemetry and commands.
-4. Spawns the MAVLink comm process (`comm_process_loop` from `mavlink_node.py`) as a daemon process.
-5. Waits `startup.pixhawk_init_delay_s` seconds (default: 6s) for Pixhawk heartbeat + EKF convergence.
-6. Creates `VisionBridge` instance (subscribes to `/erc/vision_targets`).
-7. Creates `MissionController` instance (the state machine).
-
-**Main loop (runs for the entire mission):**
-```python
-while mission.state != FlightState.MISSION_DONE:
-    mission.update()    # Single call drives the entire system
-    time.sleep(0.02)    # 50 Hz
+```text
+indomitus-drone/
+├── main.py                              # Single-mission orchestrator (50 Hz loop, standby delay, Ctrl+C LAND)
+├── requirements.txt                     # Python venv dependencies (pymavlink, numpy, pyyaml, opencv, SPI/LED)
+├── config/
+│   ├── mission_params.yaml              # Tunable flight, marker, grid, serial, ROS 2 (domain 27), timeout & LED params
+│   ├── camera_calibration.npz           # Active Arducam IMX708 intrinsics & distortion coefficients
+│   └── camera_calibration_old.npz       # Backup calibration file
+├── docs/
+│   ├── ARCHITECTURE.md                  # System architecture reference (this document)
+│   ├── IMPROVEMENT_PLAN.md              # Audit of current code/architecture issues & roadmap
+│   ├── SETUP_RASPBERRY.md               # Raspberry Pi 5 OS (Debian Trixie) + ROS 2 Jazzy setup guide
+│   ├── usefull_commands.md              # 3-terminal quick-launch commands for flight operations
+│   └── archive/                         # Archived legacy guides, specs, and retired helper scripts
+├── hardware/
+│   ├── README.md                        # Hardware directory overview
+│   ├── cad/                             # 3D CAD models and printable mounts
+│   ├── schematics/                      # Wiring diagrams and electrical schematics
+│   └── datasheets/                      # Component datasheets and BOM
+├── matlab/
+│   ├── erc_vision_node.slx              # Simulink ROS 2 vision model (/dev/video10 -> /erc/vision_targets)
+│   ├── erc_mission_node.slx             # Simulink ROS 2 supervisory state machine (-> /erc/mission_state)
+│   ├── load_calibration_npz.m           # Loads & scales camera_calibration.npz into Simulink workspace
+│   ├── build_ros2_model.sh              # Extracts Simulink .tgz codegen archive & runs colcon build in ~/ros2_ws
+│   ├── detectAndEstimate.m              # Standalone MATLAB prototype of ArUco detection function
+│   ├── calibrate_camera.m               # Checkerboard calibration script
+│   ├── generate_markers.m               # Generates ArUco 101 & 102 PNGs (aruco_101.png, aruco_102.png)
+│   ├── desktop_prototype_static.m       # Desktop static-image ArUco test
+│   └── desktop_prototype_webcam.m       # Desktop live-webcam ArUco test
+├── scripts/
+│   ├── start_vision.sh                  # Launches v4l2loopback tee + erc_vision_node + vision_web_streamer.py
+│   ├── vision_web_streamer.py           # Multi-threaded HTTP MJPEG HUD server (:5000) reading /dev/video11
+│   └── install_ros2_jazzy.sh            # Idempotent ROS 2 Jazzy C++ & rclpy installer for RPi OS Trixie
+├── src/
+│   ├── comm/
+│   │   ├── mavlink_client.py            # PixhawkClient low-level pymavlink driver (UART, streams, LANDING_TARGET)
+│   │   └── mavlink_node.py              # Isolated comm process loop, 1 Hz heartbeat, command safety guards
+│   ├── navigation/
+│   │   └── state_machine.py             # MissionController (5 states, Simulink sync, 48-step search, safety)
+│   ├── ros_bridge/
+│   │   └── vision_subscriber.py         # VisionBridge (subscribes vision + state, publishes Pose telemetry)
+│   └── utils/
+│       ├── grid_mapper.py               # World (x, y) -> competition sector (A1..F6) converter
+│       └── led_indicator.py             # LEDController (RPi 5 Hardware SPI WS2812 driver + rpi_ws281x/mock fallback)
+└── tests/                               # Unit tests and hardware/flight test scripts
 ```
 
-**Emergency stop (Ctrl+C):**
-- Sends `set_mode("LAND")` to the Pixhawk.
-- Waits 1 second for the command to be dispatched.
-- Shuts down ROS 2 and terminates the comm process.
-- Prints final probe detection report.
-
-**Key dependency:** Must be run with ROS 2 environment sourced (`source /opt/ros/jazzy/setup.bash`). Uses `sudo -E` to preserve environment while accessing UART.
-
-#### `requirements.txt`
-**Contents:** `pymavlink`, `numpy`, `pyyaml`.
-
-**Important:** `rclpy` is NOT listed — it comes from the system ROS 2 installation at `/opt/ros/jazzy/`, not from pip. The virtual environment must be created with `--system-site-packages` to access it.
-
 ---
 
-### `src/comm/` — MAVLink Communication Layer
+## 11. External Dependencies & Filesystem Layout on Raspberry Pi
 
-This module is **copied directly from the proven old repository** (`indomitus-drone-ros2`). It has been flight-tested and should not be modified unless a bug is found.
+| Path on Raspberry Pi | Purpose | Git-Tracked Here? |
+|----------------------|---------|-------------------|
+| `~/indomitus-drone/` | Python flight bridge, scripts, configs, Simulink source models | Yes |
+| `~/ros2_ws/` | Colcon workspace holding compiled C++ `erc_vision_node` & `erc_mission_node` | No (built via `build_ros2_model.sh`) |
+| `/opt/ros/jazzy/` | System ROS 2 Jazzy installation (`rclpy`, `std_msgs`, `geometry_msgs`) | No (installed via `install_ros2_jazzy.sh`) |
+| `~/test_logs/` | Timestamped runtime logs created automatically by `scripts/start_vision.sh` | No |
 
-#### `src/comm/mavlink_client.py`
-**Role:** Low-level MAVLink serial driver. Encapsulates all direct hardware communication with the Pixhawk.
-
-**Class: `PixhawkClient`**
-- **Constructor:** Opens serial connection on `/dev/ttyAMA0` at 921600 baud. Sets `source_system=255` (GCS identity) to satisfy ArduCopter's failsafe logic.
-- **`wait_for_heartbeat()`:** Blocks until Pixhawk responds. Establishes `target_system` and `target_component` IDs used for all subsequent commands.
-- **`request_data_streams()`:** Configures Pixhawk to stream telemetry at specified rates via `MAV_CMD_SET_MESSAGE_INTERVAL`.
-- **`send_gcs_heartbeat()`:** Sends a heartbeat FROM the Pi TO the Pixhawk. Must be called at ≥1 Hz or ArduCopter triggers GCS Failsafe (RTL/LAND).
-- **`get_telemetry_tick()`:** Non-blocking read of the UART buffer. Parses ALL incoming MAVLink messages, updates an internal telemetry dictionary, and prints `STATUSTEXT` messages from the Pixhawk.
-- **`get_pose()`:** Returns the latest local-NED position + attitude with freshness check.
-
-**Command methods:**
-- `set_mode(mode_name)` — Changes flight mode (GUIDED, LOITER, LAND, RTL).
-- `arm(state, timeout)` — Arms/disarms with ACK confirmation loop.
-- `liftoff(altitude_m)` / `takeoff(altitude_m)` — Commands takeoff.
-- `land()` — Commands `MAV_CMD_NAV_LAND` with opportunistic precision landing mode.
-- `send_position_target_local_ned(dx, dy, dz)` — Relative body-offset position movement.
-- `send_local_ned_position_target(x, y, z)` — Absolute local NED position target.
-- `hold_local_ned_position(x, y, z, rate_hz, duration_s)` — Continuous position hold loop.
-- `send_velocity_target_body_ned(vx, vy, vz)` — Body-frame velocity command.
-- `land_on_target(target, initiate_landing)` — Sends `LANDING_TARGET` message for precision landing in BODY_FRD frame. Must be called continuously while the target is visible.
-
-**Internal helpers:**
-- `_ekf_flags_healthy(flags)` — Bitfield check for EKF3 health (attitude, velocity, position, no accel error).
-- `_rc_channel_count(msg)` — Counts active RC channels (900–2200 μs range).
-
-#### `src/comm/mavlink_node.py`
-**Role:** Process-level wrapper that runs `PixhawkClient` in an isolated `multiprocessing.Process`.
-
-**Function: `comm_process_loop(telemetry_queue, command_queue, connection_string, baudrate)`**
-- Runs an infinite event loop with three responsibilities:
-  1. **GCS Heartbeat** — sends at 1 Hz to prevent failsafe.
-  2. **Telemetry reading** — calls `get_telemetry_tick()`, publishes the freshest telemetry dict to `telemetry_queue` at 10 Hz. Flushes stale entries before each publish.
-  3. **Command dispatch** — reads `command_queue`, validates timestamp (drops commands older than 500 ms), dispatches to the appropriate `PixhawkClient` method.
-- CPU relief: 5 ms sleep per loop iteration.
-
-**Function: `dispatch_command(client, cmd)`**
-- Command router. Maps `cmd["action"]` strings to `PixhawkClient` methods:
-  - `"arm"` → `client.arm()`
-  - `"set_mode"` → `client.set_mode()`
-  - `"takeoff"` → `client.takeoff()`
-  - `"land"` → `client.land()`
-  - `"move_local_pos"` → `client.send_position_target_local_ned()`
-  - `"set_local_position"` → `client.send_local_ned_position_target()`
-  - `"move_local_vel"` → `client.send_velocity_target_body_ned()`
-  - `"land_on_target"` → `client.land_on_target()`
-
-**Function: `create_command(action, **kwargs)`**
-- Helper for the state machine. Creates a command dict with an auto-injected timestamp.
----
-
-### `src/ros_bridge/` — ROS 2 Integration Layer
-
-#### `src/ros_bridge/vision_subscriber.py` ✅ IMPLEMENTED
-**Role:** ROS 2 bridge that subscribes to `/erc/vision_targets`.
-
-**Public Class: `VisionBridge`**
-- **`spin_once()`** — Must be called on every main loop iteration to process DDS messages.
-- **`get_latest_target()`** — Returns dictionary of ArUco marker detection (id, x, y, age).
-- **`get_detected_probes()`** — Returns sorted list of detected probe sector IDs.
-
----
-
-### `src/navigation/` — Autonomous Flight Logic
-
-#### `src/navigation/state_machine.py` ✅ IMPLEMENTED
-**Role:** The core autonomous flight state machine. Implements the Search → Align → Land mission cycle.
-
-**Class: `FlightState` (Enum)**
-- States: IDLE, TAKEOFF, SEARCH, ALIGN, LAND, COMPLETE, MISSION_DONE.
-
-**Class: `MissionController`**
-
-*Constructor:* `MissionController(command_queue, telemetry_queue, vision_bridge, config)`
-
-*Core method: `update()`*
-- Called 50 times/second by `main.py`.
-- Refreshes telemetry, processes ROS 2 messages via `vision.spin_once()`, then dispatches to current state's handler.
-
-*State handlers:*
-
-| Handler | Work Done Each Tick | Exit Condition |
-|---------|--------------------|-----------------|
-| `_update_idle()` | Check telemetry connection + EKF health | Both healthy → TAKEOFF |
-| `_update_takeoff()` | Sequence: LOITER → ARM → GUIDED → takeoff | Alt ≥ 90% target → SEARCH. Timeout 15s → LAND |
-| `_update_search()` | Hover at altitude, poll vision for marker 102 | Marker 102 detected → ALIGN. Timeout 60s → LAND |
-| `_update_align()` | Velocity corrections: `vx = Kp * y_offset`, `vy = Kp * x_offset` | Centered < 5cm for 1s → LAND. Lost > 0.5s → SEARCH |
-| `_update_land()` | Send `LANDING_TARGET` in BODY_FRD frame | Alt ≈ 0 + disarmed → COMPLETE |
-| `_update_complete()` | Increment attempt, log probes, print report | Attempt < 3 → IDLE. Attempt = 3 → MISSION_DONE |
-
----
-
-### `src/utils/` — Utility Modules
-
-#### `src/utils/grid_mapper.py` ✅ IMPLEMENTED
-**Role:** Converts probe world coordinates (x, y) to grid sector IDs.
-
----
-
-### `config/` — Configuration Files
-
-#### `config/mission_params.yaml`
-**Role:** Single source of truth for all tunable parameters.
-
----
-
-## 11. External Dependencies & Filesystem Layout
-
-### Key Distinction
-
-| Directory | Managed By | Git-Tracked? |
-|-----------|-----------|--------------|
-| `~/indomitus-drone/` | You (developer) | ✅ Yes |
-| `~/ros2_ws/` | Simulink Blockset | ❌ No |
-| `/opt/ros/jazzy/` | APT package manager | ❌ No |
+> **Virtual Environment Note:** `.venv` on the Raspberry Pi must be created with `python3 -m venv .venv --system-site-packages` so it can import both system ROS 2 packages (`rclpy`) and pip packages (`pymavlink`, `spidev`, `opencv-python`, etc.).
 
 ---
 
 ## 12. Startup & Deployment Sequence
 
-### Competition Day Sequence
+### Running a Mission (3 Terminals — see [`docs/usefull_commands.md`](usefull_commands.md))
 
-```
-Step 1: SSH in, verify Pixhawk UART connection
-Step 2: Start Simulink vision node
-Step 3: cd ~/indomitus-drone && ./scripts/start_mission.sh
-Step 4: System executes mission
-```
+1. **Terminal 1 — Vision Pipeline & Web HUD:**
+   Runs `./scripts/start_vision.sh`, which creates `/dev/video10` & `/dev/video11`, starts `erc_vision_node` (`ROS_DOMAIN_ID=27`), and starts `vision_web_streamer.py` on port `5000`.
+2. **Terminal 2 — Simulink Mission Supervisor:**
+   Sources `~/ros2_ws/install/setup.bash`, exports `ROS_DOMAIN_ID=27`, and runs `ros2 run erc_mission_node erc_mission_node`.
+3. **Terminal 3 — Python Flight Mission:**
+   Activates `.venv`, exports `ROS_DOMAIN_ID=27`, and runs `python3 main.py`. Once the pilot switches to `GUIDED`, the drone executes one full `IDLE → TAKEOFF → SEARCH → DESCEND → COMPLETE` cycle.
+
+*(If operating without Wi-Fi/SSH, the operator can switch the VTX to the Raspberry Pi composite video channel and run these terminals directly on the Pi desktop using a connected mouse.)*
 
 ---
 
 ## 13. Configuration Reference
 
-### ArduCopter Parameters
+### Key ArduCopter Parameters (Pixhawk 6C)
 
-| Parameter | Value |
-|-----------|-------|
-| `SERIAL2_PROTOCOL` | 2 |
-| `SERIAL2_BAUD` | 921600 |
-| `PLND_ENABLED` | 1 |
-| `PLND_TYPE` | 1 |
-
----
-
-## 14. Implementation Status (as of 2026-08-08)
-
-| File | Status | Notes |
-|------|--------|-------|
-| `src/comm/mavlink_client.py` | ✅ Complete | Flight-tested, copied from old repo |
-| `src/comm/mavlink_node.py` | ✅ Complete | Process loop + command dispatcher |
-| `src/ros_bridge/vision_subscriber.py` | ✅ Complete | VisionBridge class |
-| `src/utils/grid_mapper.py` | ✅ Complete | GridMapper class |
-| `src/navigation/state_machine.py` | ✅ Complete | MissionController with 7 states, P-controller |
-| `main.py` | ✅ Complete | Orchestrator with 50 Hz loop |
-| `tests/test_dummy_publisher.py` | ✅ Complete | 5 simulation modes |
-| `tests/test_grid_mapper.py` | ✅ Complete | 14 tests passing |
-| `config/mission_params.yaml` | ✅ Complete | All parameters defined |
-| `docs/ARCHITECTURE.md` | ✅ Complete | This file |
-
-**All core Python files are implemented.** The system is ready for bench testing with the dummy publisher.
-
-### TODO — Improvements to Existing Code
-
-#### Search Sweep Pattern — Priority: MEDIUM
-
-The SEARCH state currently just hovers and waits for the marker to appear.
-Given the 120° wide-angle lens at 2 m altitude (~7 × 5 m coverage), this
-may actually work without a sweep. However, if testing shows the camera
-can't see the disc from the takeoff position, implement one of:
-
-- **Expanding square spiral** — move in an expanding square pattern around the takeoff point.
-- **Grid sweep** — visit a grid of waypoints within the 3 m search radius.
-- **Random walk** — move to random positions within bounds (simplest but least efficient).
-
-Use `send_local_ned_position_target()` to command waypoint movements.
-
-#### PID Controller for ALIGN — Priority: MEDIUM
-
-The ALIGN state currently uses a simple proportional (P-only) controller:
-```python
-vx = Kp * y_offset
-vy = Kp * x_offset
-```
-
-This may cause oscillation if `Kp` is too high, or slow convergence if too low.
-Improve to full PID if flight testing shows instability:
-
-- **P** — proportional to offset (already implemented).
-- **I** — integral of offset over time (corrects steady-state drift from wind).
-- **D** — derivative of offset change rate (dampens oscillation).
-
-Note: The Pixhawk's internal GUIDED-mode PID also contributes damping,
-so the outer loop (our controller) may work fine as P-only. Test first.
-
-#### Precision Landing Tuning — Priority: MEDIUM
-
-The LAND state already implements camera-to-BODY_FRD conversion and sends
-`LANDING_TARGET` messages. The axis mapping may need adjustment during
-flight testing depending on camera mounting orientation:
-
-```python
-# Current implementation (in state_machine.py _update_land):
-body_x = target["y_offset_m"]     # camera Y → body forward
-body_y = target["x_offset_m"]     # camera X → body right
-body_z = max(altitude, 0.1)       # altitude → body down
-```
-
-If the drone lands consistently offset in one direction, the axis mapping
-or sign convention needs correction. Test with props off first.
-
-#### Custom ROS 2 Message Type — Priority: LOW
-
-Currently using `geometry_msgs/msg/Point` with the `z` field encoding
-detection type (marker ID, probe flag, or no-detection). This works but
-is fragile. A proper approach would be a custom `.msg` definition:
-
-```
-# VisionTarget.msg
-float64 x_offset       # meters
-float64 y_offset       # meters
-int32   marker_id      # 101, 102, or 0
-bool    is_probe       # true if this is a probe detection
-float64 confidence     # 0.0–1.0
-```
-
-This requires creating a ROS 2 package with message generation. Only worth
-doing if the Simulink team builds it into their model.
-
-#### Simulink Vision Model — Priority: HIGH (parallel track)
-
-The Simulink model must be designed in MATLAB and deployed to `~/ros2_ws/`.
-It needs to:
-
-1. Capture camera frames via V4L2 (`/dev/video0`).
-2. Detect ArUco markers (IDs 101, 102) using Computer Vision Toolbox.
-3. Estimate marker pose using `solvePnP` with `config/camera_calibration.npz`.
-4. Detect probes (color/shape-based algorithm — TBD).
-5. Publish results to `/erc/vision_targets` as `geometry_msgs/msg/Point`.
-
-This is a separate development track done in MATLAB, not in this Python repo.
-Until the Simulink model is ready, use `tests/test_dummy_publisher.py` as
-a stand-in.
-
-#### Web UI / Telemetry Dashboard — Priority: LOW
-
-The old repo had a `web_ui/` module with a Flask server for real-time
-telemetry display. Evaluate whether this is needed for competition.
-The pilot already has FPV video and Mission Planner telemetry, so a
-custom dashboard may be unnecessary.
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `SERIAL2_PROTOCOL` | `2` | MAVLink 2 on TELEM2 (wired to Pi UART `/dev/ttyAMA0`) |
+| `SERIAL2_BAUD` | `921` | 921600 baud |
+| `PLND_ENABLED` | `1` | Enable precision landing |
+| `PLND_TYPE` | `1` | Companion computer (`MAVLink LANDING_TARGET`) |
+| `FENCE_ENABLE` | `1` | Mission Planner geofence enabled (uses Holybro M10 GPS) |

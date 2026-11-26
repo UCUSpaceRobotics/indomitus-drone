@@ -1,5 +1,14 @@
+# Core flight & configuration
 pymavlink
 numpy
 pyyaml
-rpi_ws281x
+
+# Vision web streamer (scripts/vision_web_streamer.py)
+opencv-python
+
+# Raspberry Pi LED indicator (src/utils/led_indicator.py)
 spidev
+rpi_ws281x
+
+# Note: rclpy, std_msgs, and geometry_msgs come from the system ROS 2 Jazzy
+# installation (/opt/ros/jazzy). Create .venv with --system-site-packages.

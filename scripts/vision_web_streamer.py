@@ -3,7 +3,7 @@
 
 Usage on Raspberry Pi:
     source /opt/ros/jazzy/setup.bash
-    export ROS_DOMAIN_ID=42
+    export ROS_DOMAIN_ID=27
     python3 scripts/vision_web_streamer.py
 """
 
